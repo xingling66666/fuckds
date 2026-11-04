@@ -79,7 +79,17 @@ export function normalizeMessagesRequest(body, config) {
 /** count_tokens 接口：按拼出来的 prompt 估算，和实际请求用的是同一套拼装逻辑 */
 export function countMessagesTokens(body, config) {
   const request = normalizeMessagesRequest(body, config);
-  const built = buildPrompt({ messages: request.messages, tools: request.tools });
+
+  // 和 chat-runner 的 prepare() 保持同一套规则：完整声明放不下就按压缩索引估算，
+  // 否则上百个工具时这里会报出一个远大于实际请求的 token 数。
+  const mode = config?.runtime?.toolDeclMode ?? 'auto';
+  const maxChars = config?.runtime?.maxPromptChars ?? 100_000;
+
+  let built = buildPrompt({ messages: request.messages, tools: request.tools, toolDeclMode: mode === 'compact' ? 'compact' : 'full' });
+  if (mode === 'auto' && built.prompt.length > maxChars) {
+    built = buildPrompt({ messages: request.messages, tools: request.tools, toolDeclMode: 'compact' });
+  }
+
   return estimateTokens(built.prompt);
 }
 

@@ -6,6 +6,7 @@ import {
   normalizeArguments,
   parseToolCalls,
   readJsonObject,
+  renderCompactToolDeclarations,
   renderToolDeclarations,
   renderToolResult,
 } from '../src/prompt/tools.mjs';
@@ -332,4 +333,104 @@ test('parse: 原生 token / DSML / DO 混用不会重复', () => {
     calls.map((c) => c.name),
     ['exec_shell', 'bash'],
   );
+});
+
+test('compact: 一行一个工具，标出必填与类型', () => {
+  const lines = renderCompactToolDeclarations([
+    {
+      type: 'function',
+      function: {
+        name: 'bash',
+        description: '执行 shell 命令',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' }, timeout: { type: 'number' } },
+          required: ['command'],
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(lines, ['bash(command:string*, timeout:number) — 执行 shell 命令']);
+});
+
+test('compact: 没有参数也能渲染', () => {
+  const lines = renderCompactToolDeclarations([{ function: { name: 'browser_status', description: '查看浏览器' } }]);
+  assert.deepEqual(lines, ['browser_status() — 查看浏览器']);
+});
+
+test('compact: 长描述被截断，且拒绝没有名字的工具', () => {
+  const lines = renderCompactToolDeclarations([
+    { function: { name: 'x', description: '长'.repeat(500) } },
+    { function: { description: '没有名字' } },
+  ]);
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].length < 120, `压缩后应显著变短，实际 ${lines[0].length}`);
+});
+
+test('compact: 体积远小于完整 JSON 声明', () => {
+  const tools = Array.from({ length: 60 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `工具 ${i} ${'说明文字'.repeat(200)}`,
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, cwd: { type: 'string' } },
+        required: ['command'],
+      },
+    },
+  }));
+  const full = renderToolDeclarations(tools).join('\n').length;
+  const compact = renderCompactToolDeclarations(tools).join('\n').length;
+  assert.ok(compact * 5 < full, `压缩应至少省 80%，实际 ${compact}/${full}`);
+});
+
+test('compact: 枚举取值要带上，否则模型只能猜', () => {
+  const lines = renderCompactToolDeclarations([
+    {
+      function: {
+        name: 'op',
+        description: '操作',
+        parameters: {
+          type: 'object',
+          properties: {
+            mode: { type: 'string', enum: ['snapshot', 'restore', 'prune'] },
+            target: { type: 'string' },
+          },
+          required: ['mode', 'target'],
+        },
+      },
+    },
+  ]);
+  assert.deepEqual(lines, ['op(mode:string[snapshot|restore|prune]*, target:string*) — 操作']);
+});
+
+test('compact: 枚举取值要限量，否则长枚举会把索引撑爆', () => {
+  const bigEnum = Array.from({ length: 100 }, (_, i) => `value_${i}_something_long`);
+  const lines = renderCompactToolDeclarations([
+    {
+      function: {
+        name: 'tool',
+        description: '工具',
+        parameters: { type: 'object', properties: { mode: { type: 'string', enum: bigEnum } } },
+      },
+    },
+  ]);
+  const line = lines[0];
+  assert.ok(line.length < 250, `单行不该过长，实际 ${line.length}`);
+  assert.ok(line.includes('…'), '应标出还有更多取值');
+  assert.ok(line.includes('value_0_something_long'), '前几个取值要保留');
+});
+
+test('compact: 枚举里的数字/布尔值也能渲染', () => {
+  const lines = renderCompactToolDeclarations([
+    {
+      function: {
+        name: 'tool',
+        description: '工具',
+        parameters: { type: 'object', properties: { level: { enum: [1, 2, true] } } },
+      },
+    },
+  ]);
+  assert.deepEqual(lines, ['tool(level:any[1|2|true]) — 工具']);
 });

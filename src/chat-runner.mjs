@@ -9,7 +9,7 @@ import {
 } from './openai/tool-text.mjs';
 import { buildPrompt } from './prompt/build.mjs';
 import { planOverflow } from './prompt/overflow.mjs';
-import { coerceToolCallArguments, getToolSchemas, parseToolCalls } from './prompt/tools.mjs';
+import { coerceToolCallArguments, getToolSchemas, parseToolCalls, renderToolDeclarations } from './prompt/tools.mjs';
 
 /**
  * 引擎调用的公共部分：拼 prompt → 图片/超长附件上传 → 调 web.chat → 解析工具调用。
@@ -17,6 +17,9 @@ import { coerceToolCallArguments, getToolSchemas, parseToolCalls } from './promp
  * OpenAI 和 Anthropic 两个协议层只负责请求归一化和响应格式，执行逻辑都在这里，
  * 保证两条链路在「防自造结果」「超长转附件」上的行为完全一致。
  */
+/** 压缩索引模式下的伪工具名：模型用它请求某个工具的完整定义 */
+const SCHEMA_TOOL = '__tool_schema';
+
 export function createChatRunner({ config, log, web }) {
   /**
    * @param {object} request 归一化后的内部请求（messages 为 OpenAI 语义）
@@ -28,12 +31,35 @@ export function createChatRunner({ config, log, web }) {
    * @param {(text: string) => void} [hooks.onReasoning] 流式思考增量
    */
   return async function runChat(request, { signal, meta = {}, onPrompt, onContent, onReasoning } = {}) {
-    const { maxPromptChars, maxAttachmentChars, overflowToAttachment } = config.runtime;
+    const { maxPromptChars, maxAttachmentChars, overflowToAttachment, toolDeclMode = 'auto' } = config.runtime;
 
-    /** 拼 prompt；超过输入框上限时把较早的段落拆成附件 */
+    /**
+     * 拼 prompt；超过输入框上限时把较早的段落拆成附件。
+     *
+     * auto 模式下：完整工具声明放得下就用完整；一旦需要拆分，就改用压缩索引重建。
+     * 否则上百个工具的完整声明（可能上百 KB）会把正文挤干，模型等于看不到对话。
+     */
     const prepare = (systemExtra = '') => {
-      const built = buildPrompt({ messages: request.messages, tools: request.tools, systemExtra });
+      const mode = toolDeclMode;
+      const build = (declMode) =>
+        buildPrompt({ messages: request.messages, tools: request.tools, systemExtra, toolDeclMode: declMode });
+
+      let built = build(mode === 'compact' ? 'compact' : 'full');
       if (!overflowToAttachment) return { built, prompt: built.prompt, attachment: null };
+
+      // 完整声明就已经放得下：直接用，不做任何压缩
+      if (mode !== 'compact' && built.prompt.length <= maxPromptChars) {
+        return { built, prompt: built.prompt, attachment: null };
+      }
+
+      // auto：需要拆分时改压缩索引，把正文空间腾给对话
+      if (mode === 'auto') {
+        built = build('compact');
+        if (built.prompt.length <= maxPromptChars) {
+          return { built, prompt: built.prompt, attachment: null };
+        }
+      }
+
       const plan = planOverflow(built.prompt, { maxChars: maxPromptChars, maxAttachmentChars });
       return { built, prompt: plan.prompt, attachment: plan.attachment };
     };
@@ -60,6 +86,8 @@ export function createChatRunner({ config, log, web }) {
         name: plan.attachment.name,
         chars: plan.attachment.chars,
         sections: plan.attachment.sections,
+        // 工具声明被挪进附件时模型会丢格式约定，必须能从日志看出来
+        moved: plan.attachment.moved,
       });
       return ids;
     };
@@ -128,7 +156,10 @@ export function createChatRunner({ config, log, web }) {
       // 未知工具名是「模型自己在乱叫」的信号：照实返回（客户端会回一条 unknown tool 让它纠正），
       // 但不能静默——以前这里连日志都没有，出事只能靠猜。
       if (toolCalls.length && knownToolSet) {
-        const unknown = toolCalls.filter((call) => !knownToolSet.has(call.name));
+        // __tool_schema 是服务端内置的伪工具，不是模型乱叫的工具，别报假警
+        const unknown = toolCalls.filter(
+          (call) => call.name !== SCHEMA_TOOL && !knownToolSet.has(call.name),
+        );
         if (unknown.length) {
           log?.warn('模型调用了未声明的工具，已照实返回给客户端', {
             names: unknown.map((call) => call.name),
@@ -156,6 +187,193 @@ export function createChatRunner({ config, log, web }) {
     const cleanReasoning = (reasoning) =>
       reasoning && hasFabricatedProtocol(reasoning) ? stripToolMarkup(reasoning) : reasoning || '';
 
+    /** 本轮输出「不可用」：既没有正文也没有工具调用，客户端会收到空 assistant 消息 */
+    const unusable = (reply) => !String(reply?.content ?? '').trim() && !reply.toolCalls.length;
+
+    /**
+     * 模型偶发退化时的纠错提示。
+     * 不新建对话、不重发整段 prompt：就在当前会话里补一条，让模型接着把话说完。
+     */
+    const CORRECTIVE_PROMPT = [
+      '你上一条回复在输出工具调用时中断了，没有给出可用的内容。',
+      '请立刻重新完整地输出：要么输出完整的工具调用，要么直接给出最终正文。',
+      '不要解释原因，不要道歉，不要重复已经输出过的内容。',
+    ].join('\n');
+
+    /**
+     * 本轮不可用时，在同一会话里续一条纠错，再把两段原文拼起来重新解析。
+     *
+     * 为什么拼接：截断的那半截 DSML 解析不出来，但模型续写出来的完整调用能被认出来，
+     * 拼在一起统一重解析，就不必去猜「断在哪个字符」。
+     *
+     * 引擎不支持续写（比如 browser 引擎）或拿不到 sessionId 时，原样返回。
+     */
+    const correct = async (result, reply, hooks = {}) => {
+      if (!unusable(reply)) return { result, reply };
+      if (!web.supportsContinue || !result?.sessionId) return { result, reply };
+
+      log?.warn?.('本轮没有可用输出（空正文 / 半截协议块），在同一会话里纠错续写', {
+        chars: String(result.text ?? '').length,
+        sessionId: result.sessionId,
+        messageId: result.messageId ?? null,
+      });
+
+      try {
+        const fix = await web.chat({
+          prompt: CORRECTIVE_PROMPT,
+          // 纠错只求把话说完，不再开深度思考，省一轮时间
+          thinking: false,
+          search: false,
+          refFileIds: [],
+          signal,
+          meta,
+          onDelta: hooks.onDelta,
+          onThinking: hooks.onThinking,
+          continueSessionId: result.sessionId,
+          parentMessageId: result.messageId,
+          // 会话是账号绑定的：换号续写会 invalid chat session id
+          continueAccountIndex: result.accountIndex ?? null,
+        });
+
+        const merged = `${result.text ?? ''}${fix.text ?? ''}`;
+        const nextReply = promoteFromReasoning(fix.reasoning, evaluate(merged));
+        if (!unusable(nextReply)) {
+          log?.info?.('纠错续写拿回了可用输出', {
+            originalChars: String(result.text ?? '').length,
+            fixChars: String(fix.text ?? '').length,
+            toolCalls: nextReply.toolCalls.length,
+          });
+          return {
+            result: {
+              ...result,
+              text: merged,
+              reasoning: `${result.reasoning ?? ''}${fix.reasoning ?? ''}`,
+              elapsedMs: (result.elapsedMs ?? 0) + (fix.elapsedMs ?? 0),
+            },
+            reply: nextReply,
+          };
+        }
+        log?.warn?.('纠错续写后仍不可用', { fixChars: String(fix.text ?? '').length });
+      } catch (err) {
+        log?.warn?.('纠错续写失败，按原结果返回', { message: err.message });
+      }
+      return { result, reply };
+    };
+
+    /* ---------------- 按需展开工具 schema（压缩索引模式） ---------------- */
+
+    const MAX_SCHEMA_LOOPS = 3;
+
+    /** 把一次 __tool_schema 调用的参数解析成工具名 */
+    const schemaNames = (calls) =>
+      calls
+        .map((call) => {
+          try {
+            const args = JSON.parse(call.arguments || '{}');
+            return String(args.name ?? args.tool ?? '').trim();
+          } catch {
+            return '';
+          }
+        })
+        .filter(Boolean);
+
+    /** 客户端自己声明了同名工具时不要劫持它 */
+    const pseudoToolEnabled = !(request.tools ?? []).some(
+      (tool) => (tool?.function ?? tool)?.name === SCHEMA_TOOL,
+    );
+
+    /** 从客户端声明的 tools 里找完整定义 */
+    const findToolDecl = (name) => {
+      const hit = (request.tools ?? []).find((tool) => (tool?.function ?? tool)?.name === name);
+      return hit ? renderToolDeclarations([hit])[0] : null;
+    };
+
+    /**
+     * 模型请求完整 schema 时，在同一个会话里把定义喂回去再继续生成。
+     *
+     * 对客户端透明：__tool_schema 不会被返回，只返回它最终真正要调用的工具。
+     * 最多展开 3 轮，避免模型反复查询死循环。
+     */
+    const expandToolSchemas = async (result, reply, hooks = {}) => {
+      let guard = 0;
+      let current = result;
+      let accumulated = result.text ?? '';
+      let pending = reply;
+
+      while (guard < MAX_SCHEMA_LOOPS) {
+        const wanted = pseudoToolEnabled
+          ? pending.toolCalls.filter((call) => call.name === SCHEMA_TOOL)
+          : [];
+        if (!wanted.length) break;
+        if (!web.supportsContinue || !current?.sessionId) break;
+
+        const names = [...new Set(schemaNames(wanted))];
+        const declarations = names.map(findToolDecl).filter(Boolean);
+        if (!declarations.length) {
+          log?.warn?.('模型请求了不存在的工具 schema', { names });
+          break;
+        }
+
+        guard += 1;
+        log?.info?.('模型要求展开工具 schema，在同一会话里补回完整定义', {
+          names,
+          round: guard,
+        });
+
+        const promptText = [
+          '# Messages:',
+          '## Tool_call_result:',
+          declarations.join('\n'),
+          '',
+          '以上是完整定义。请据此继续：直接输出真正的工具调用，或给出最终回答。',
+        ].join('\n');
+
+        const fix = await web.chat({
+          prompt: promptText,
+          thinking: false,
+          search: false,
+          refFileIds: [],
+          signal,
+          meta,
+          onDelta: hooks.onDelta,
+          onThinking: hooks.onThinking,
+          continueSessionId: current.sessionId,
+          parentMessageId: current.messageId,
+          continueAccountIndex: current.accountIndex ?? null,
+        });
+
+        accumulated += fix.text ?? '';
+        current = {
+          ...current,
+          text: accumulated,
+          reasoning: `${current.reasoning ?? ''}${fix.reasoning ?? ''}`,
+          sessionId: fix.sessionId ?? current.sessionId,
+          messageId: fix.messageId ?? current.messageId,
+          elapsedMs: (current.elapsedMs ?? 0) + (fix.elapsedMs ?? 0),
+        };
+
+        // 只看这一轮新生成的内容：累计原文里还留着上一轮的 __tool_schema 调用，
+        // 拿它判断会一直命中、反复续写（第一版就栽在这）。
+        pending = promoteFromReasoning(fix.reasoning, evaluate(fix.text ?? ''));
+      }
+
+      // 没展开过就别动原来的解析结果：promoteFromReasoning 从思考里提升出来的调用，
+      // 重新 evaluate 正文会把它丢掉。但伪工具无论如何都不能漏给客户端。
+      const dropPseudo = (calls) =>
+        pseudoToolEnabled ? calls.filter((call) => call.name !== SCHEMA_TOOL) : calls;
+
+      if (!guard) {
+        return { result, reply: { ...reply, toolCalls: dropPseudo(reply.toolCalls) } };
+      }
+
+      // 出口用累计原文统一重解析，再把伪工具剔掉
+      const finalReply = evaluate(accumulated);
+      return {
+        result: current,
+        reply: { ...finalReply, toolCalls: dropPseudo(finalReply.toolCalls) },
+      };
+    };
+
     const run = (promptText = prompt, ids = fileIds, hooks = {}) =>
       web.chat({
         prompt: promptText,
@@ -172,6 +390,12 @@ export function createChatRunner({ config, log, web }) {
       // 不检测、不中断、不截断：模型写多少就收多少，出口只做协议清洗（RESULT 行从正文里剔掉）
       let result = await run(prompt, fileIds);
       let reply = promoteFromReasoning(result.reasoning, evaluate(result.text));
+
+      // 压缩索引模式下模型可能先要求完整 schema：在同一会话里补回后再解析
+      ({ result, reply } = await expandToolSchemas(result, reply));
+
+      // 空正文 / 半截协议块：在同一会话里续一条纠错，而不是让客户端收到空回答
+      ({ result, reply } = await correct(result, reply));
 
       if (reply.fabricated) {
         log?.warn?.('模型输出了自造的工具结果（RESULT），已从正文里剔除', {
@@ -205,7 +429,7 @@ export function createChatRunner({ config, log, web }) {
       onReasoning?.(text);
     };
 
-    const result = await web.chat({
+    let result = await web.chat({
       prompt,
       thinking: request.thinking,
       search: request.search,
@@ -218,9 +442,29 @@ export function createChatRunner({ config, log, web }) {
       },
       onThinking: (text) => emitReasoning(text),
     });
-    const authoritativeText = result.text;
 
-    const reply = promoteFromReasoning(result.reasoning, evaluate(authoritativeText));
+    let reply = promoteFromReasoning(result.reasoning, evaluate(result.text));
+
+    // 同非流式：先把 __tool_schema 请求展开，再判断是否为空回答
+    ({ result, reply } = await expandToolSchemas(result, reply, {
+      onDelta: (text) => {
+        const safe = filter.push(text);
+        if (safe) emitContent(safe);
+      },
+      onThinking: (text) => emitReasoning(text),
+    }));
+
+    // 同非流式：空正文 / 半截协议块时在同一会话里续写纠错。
+    // 纠错产生的增量同样走协议过滤后补发，不破坏已有 SSE。
+    ({ result, reply } = await correct(result, reply, {
+      onDelta: (text) => {
+        const safe = filter.push(text);
+        if (safe) emitContent(safe);
+      },
+      onThinking: (text) => emitReasoning(text),
+    }));
+
+    const authoritativeText = result.text;
     if (reply.fabricated) {
       log?.warn?.('模型输出了自造的工具结果（RESULT），已从流式 content 中剔除', {
         toolCalls: reply.toolCalls.length,

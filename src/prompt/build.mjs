@@ -1,7 +1,7 @@
 import { ApiError } from '../errors.mjs';
 import { contentToText } from '../util.mjs';
 import { FINAL_ANSWER_HINT, PROMPT_HEADER, REPLY_END_TOKEN, SECTION, SPECIAL_TOKENS_HEADER } from './special.mjs';
-import { collectToolNames, renderToolDeclarations, renderToolResult } from './tools.mjs';
+import { collectToolNames, renderCompactToolDeclarations, renderToolDeclarations, renderToolResult } from './tools.mjs';
 
 const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool', 'function']);
 
@@ -43,7 +43,32 @@ const VALID_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool',
  * - 工具结果**单独成段**（## Tool_call_result），不塞进 ## Assistant，
  *   模型就不会把「assistant 说调用、然后自己写结果」当成正确的模仿对象。
  */
-export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
+/**
+ * 压缩索引模式下告诉模型：需要精确 schema 时先查。
+ * 服务端会把 __tool_schema 拦下来（不返回给客户端），在同一会话里补回完整定义后继续生成。
+ */
+const COMPACT_TOOL_HINT = `
+## 工具列表是压缩索引（必须先查再用）
+
+上面 ## Tool_functions: 里每个工具只写了「名字(参数名:类型)」，带 * 的是必填参数。
+
+**规则：**
+1. 只要你不能确定某个参数该填什么（例如枚举取值、格式、必填项之间的依赖），
+   **必须先查它的完整定义**，不要猜、也不要因为不确定就直接放弃任务或只回一句「好的」。
+2. 查完再调用；参数已经明确时直接调用即可。
+
+查询写法：
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="__tool_schema">
+<｜DSML｜ parameter name="name" string="true">要查的工具名</｜DSML｜ parameter>
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+服务端会把完整定义作为工具结果返回，你据此继续完成任务。一次可以查多个工具。
+`;
+
+export function buildPrompt({ messages, tools = [], systemExtra = '', toolDeclMode = 'full' }) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new ApiError(400, 'messages 不能为空', { code: 'invalid_messages' });
   }
@@ -109,9 +134,16 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
   const systemBody = [...systemTexts, extra].filter(Boolean).join('\n\n');
   if (systemBody) parts.push(systemBody);
 
-  const toolLines = renderToolDeclarations(tools);
+  // full：完整 JSON 声明；compact：一行一个工具（体积约剩 1/10，且永不挪进附件）
+  const toolLines =
+    toolDeclMode === 'compact' ? renderCompactToolDeclarations(tools) : renderToolDeclarations(tools);
   if (toolLines.length) {
     parts.push('', SECTION.tools, ...toolLines);
+  }
+
+  // 压缩索引只是一行摘要；模型需要精确参数说明时，可以先查完整 schema
+  if (toolDeclMode === 'compact' && toolLines.length) {
+    parts.push('', SECTION.system, COMPACT_TOOL_HINT.trim());
   }
 
   // 自带的协议提示词：单独一个 system 块，放在 TOOL_FUNCTIONS 之后、USER 之前
@@ -137,6 +169,7 @@ export function buildPrompt({ messages, tools = [], systemExtra = '' }) {
       sections: sections.length,
       systemMessages: systemTexts.length,
       tools: toolLines.length,
+      toolDeclMode,
     },
   };
 }
