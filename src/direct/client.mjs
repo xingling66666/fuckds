@@ -153,7 +153,24 @@ export class DirectEngine {
    * 请求
    * ------------------------------------------------------------------ */
 
-  async chat({ prompt, thinking = false, search = false, refFileIds = [], signal, onDelta, onThinking, meta = {} }) {
+  /** 支持「同一个会话里续一条」：模型偶发退化时用来纠错，不用重开对话 */
+  get supportsContinue() {
+    return true;
+  }
+
+  async chat({
+    prompt,
+    thinking = false,
+    search = false,
+    refFileIds = [],
+    signal,
+    onDelta,
+    onThinking,
+    meta = {},
+    continueSessionId = null,
+    parentMessageId = null,
+    continueAccountIndex = null,
+  }) {
     if (prompt.length > this.config.runtime.maxPromptChars) {
       throw new PromptTooLongError(
         `拼接后的 prompt 有 ${prompt.length} 字符，超过上限 ${this.config.runtime.maxPromptChars}`,
@@ -171,7 +188,13 @@ export class DirectEngine {
         if (signal?.aborted) throw new UpstreamError('客户端已断开', { status: 499, code: 'client_closed' });
 
         const now = Date.now();
-        const account = this.pool.pick(now);
+        // 续写（纠错）必须回到原会话所属的那个账号：DeepSeek 的 session 是账号绑定的，
+        // 换号会直接报 invalid chat session id。
+        const pinned =
+          continueAccountIndex !== null && continueAccountIndex !== undefined
+            ? this.pool.accounts[continueAccountIndex] ?? null
+            : null;
+        const account = pinned && pinned.cooldownUntil <= now ? pinned : this.pool.pick(now);
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
@@ -188,7 +211,18 @@ export class DirectEngine {
 
         try {
           const result = await this.#run({
-            account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta,
+            account,
+            prompt,
+            thinking,
+            search,
+            refFileIds,
+            signal,
+            onDelta,
+            onThinking,
+            startedAt,
+            meta,
+            continueSessionId,
+            parentMessageId,
           });
           this.pool.markHealthy(account);
           return result;
@@ -248,13 +282,25 @@ export class DirectEngine {
     }
   }
 
-  async #run({ account, prompt, thinking, search, refFileIds = [], signal, onDelta, onThinking, startedAt }) {
+  async #run({
+    account,
+    prompt,
+    thinking,
+    search,
+    refFileIds = [],
+    signal,
+    onDelta,
+    onThinking,
+    startedAt,
+    continueSessionId = null,
+    parentMessageId = null,
+  }) {
     const powStart = Date.now();
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
     const [sessionId, initialPowHeader] = await Promise.all([
-      this.#takeSession(account, signal),
+      continueSessionId ? Promise.resolve(continueSessionId) : this.#takeSession(account, signal),
       this.#powHeader(account),
     ]);
     powHeader = initialPowHeader;
@@ -303,7 +349,8 @@ export class DirectEngine {
           headers: { ...this.#headers(account), 'x-ds-pow-response': header },
           body: JSON.stringify({
             chat_session_id: sessionId,
-            parent_message_id: null,
+            // 续写时挂到上一条消息上，DeepSeek 才会把它当成同一会话里的追问
+            parent_message_id: parentMessageId ?? null,
             model_type: 'default',
             prompt,
             ref_file_ids: refFileIds,
@@ -439,6 +486,11 @@ export class DirectEngine {
           reasoning: emittedReasoning,
           streamed: emittedContent,
           streamedReasoning: emittedReasoning,
+          // 会话与消息 id：上层发现本轮输出不可用时，可据此在同一会话里续一条纠错。
+          // accountIndex 一并带出：续写必须回到同一个账号，否则会话 id 对不上。
+          sessionId,
+          messageId: state.messageId ?? null,
+          accountIndex: account.index,
           elapsedMs: Date.now() - startedAt,
           timings: {
             account: account.index + 1,

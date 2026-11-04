@@ -156,6 +156,79 @@ export function createChatRunner({ config, log, web }) {
     const cleanReasoning = (reasoning) =>
       reasoning && hasFabricatedProtocol(reasoning) ? stripToolMarkup(reasoning) : reasoning || '';
 
+    /** 本轮输出「不可用」：既没有正文也没有工具调用，客户端会收到空 assistant 消息 */
+    const unusable = (reply) => !String(reply?.content ?? '').trim() && !reply.toolCalls.length;
+
+    /**
+     * 模型偶发退化时的纠错提示。
+     * 不新建对话、不重发整段 prompt：就在当前会话里补一条，让模型接着把话说完。
+     */
+    const CORRECTIVE_PROMPT = [
+      '你上一条回复在输出工具调用时中断了，没有给出可用的内容。',
+      '请立刻重新完整地输出：要么输出完整的工具调用，要么直接给出最终正文。',
+      '不要解释原因，不要道歉，不要重复已经输出过的内容。',
+    ].join('\n');
+
+    /**
+     * 本轮不可用时，在同一会话里续一条纠错，再把两段原文拼起来重新解析。
+     *
+     * 为什么拼接：截断的那半截 DSML 解析不出来，但模型续写出来的完整调用能被认出来，
+     * 拼在一起统一重解析，就不必去猜「断在哪个字符」。
+     *
+     * 引擎不支持续写（比如 browser 引擎）或拿不到 sessionId 时，原样返回。
+     */
+    const correct = async (result, reply, hooks = {}) => {
+      if (!unusable(reply)) return { result, reply };
+      if (!web.supportsContinue || !result?.sessionId) return { result, reply };
+
+      log?.warn?.('本轮没有可用输出（空正文 / 半截协议块），在同一会话里纠错续写', {
+        chars: String(result.text ?? '').length,
+        sessionId: result.sessionId,
+        messageId: result.messageId ?? null,
+      });
+
+      try {
+        const fix = await web.chat({
+          prompt: CORRECTIVE_PROMPT,
+          // 纠错只求把话说完，不再开深度思考，省一轮时间
+          thinking: false,
+          search: false,
+          refFileIds: [],
+          signal,
+          meta,
+          onDelta: hooks.onDelta,
+          onThinking: hooks.onThinking,
+          continueSessionId: result.sessionId,
+          parentMessageId: result.messageId,
+          // 会话是账号绑定的：换号续写会 invalid chat session id
+          continueAccountIndex: result.accountIndex ?? null,
+        });
+
+        const merged = `${result.text ?? ''}${fix.text ?? ''}`;
+        const nextReply = promoteFromReasoning(fix.reasoning, evaluate(merged));
+        if (!unusable(nextReply)) {
+          log?.info?.('纠错续写拿回了可用输出', {
+            originalChars: String(result.text ?? '').length,
+            fixChars: String(fix.text ?? '').length,
+            toolCalls: nextReply.toolCalls.length,
+          });
+          return {
+            result: {
+              ...result,
+              text: merged,
+              reasoning: `${result.reasoning ?? ''}${fix.reasoning ?? ''}`,
+              elapsedMs: (result.elapsedMs ?? 0) + (fix.elapsedMs ?? 0),
+            },
+            reply: nextReply,
+          };
+        }
+        log?.warn?.('纠错续写后仍不可用', { fixChars: String(fix.text ?? '').length });
+      } catch (err) {
+        log?.warn?.('纠错续写失败，按原结果返回', { message: err.message });
+      }
+      return { result, reply };
+    };
+
     const run = (promptText = prompt, ids = fileIds, hooks = {}) =>
       web.chat({
         prompt: promptText,
@@ -172,6 +245,9 @@ export function createChatRunner({ config, log, web }) {
       // 不检测、不中断、不截断：模型写多少就收多少，出口只做协议清洗（RESULT 行从正文里剔掉）
       let result = await run(prompt, fileIds);
       let reply = promoteFromReasoning(result.reasoning, evaluate(result.text));
+
+      // 空正文 / 半截协议块：在同一会话里续一条纠错，而不是让客户端收到空回答
+      ({ result, reply } = await correct(result, reply));
 
       if (reply.fabricated) {
         log?.warn?.('模型输出了自造的工具结果（RESULT），已从正文里剔除', {
@@ -205,7 +281,7 @@ export function createChatRunner({ config, log, web }) {
       onReasoning?.(text);
     };
 
-    const result = await web.chat({
+    let result = await web.chat({
       prompt,
       thinking: request.thinking,
       search: request.search,
@@ -218,9 +294,20 @@ export function createChatRunner({ config, log, web }) {
       },
       onThinking: (text) => emitReasoning(text),
     });
-    const authoritativeText = result.text;
 
-    const reply = promoteFromReasoning(result.reasoning, evaluate(authoritativeText));
+    let reply = promoteFromReasoning(result.reasoning, evaluate(result.text));
+
+    // 同非流式：空正文 / 半截协议块时在同一会话里续写纠错。
+    // 纠错产生的增量同样走协议过滤后补发，不破坏已有 SSE。
+    ({ result, reply } = await correct(result, reply, {
+      onDelta: (text) => {
+        const safe = filter.push(text);
+        if (safe) emitContent(safe);
+      },
+      onThinking: (text) => emitReasoning(text),
+    }));
+
+    const authoritativeText = result.text;
     if (reply.fabricated) {
       log?.warn?.('模型输出了自造的工具结果（RESULT），已从流式 content 中剔除', {
         toolCalls: reply.toolCalls.length,
