@@ -1,4 +1,5 @@
 import { ApiError } from './errors.mjs';
+import { countTokens } from './tokenizer.mjs';
 
 const TEXT_PART_TYPES = new Set(['text', 'input_text']);
 const IMAGE_PART_TYPES = new Set(['image_url', 'input_image', 'image']);
@@ -33,15 +34,30 @@ export function contentToText(content, role = 'user') {
 }
 
 /**
- * 极粗略的 token 估算：中文按 1 字 1 token，其余按 4 字符 1 token。
+ * token 计数：按仓库根目录的 `tokenizer.json`（128k BPE）真分词。
  *
- * 原实现对每个字符跑一次正则，超长 prompt（10 万字起）下是可观的
- * 常数开销；改成码点区间比较，并按码点（而非 UTF-16 单元）计数，
- * 表情等增补字符不再被算成两个。openai/response.mjs 原来还有一份
- * 逻辑相同但阈值不同的私有实现，现统一到这里，两协议口径一致。
+ * 以前这里是"中文 1 字 1 token + 其它 4 字符 1 token"的估算，误差能到 ±40%，
+ * 客户端按 usage 计费 / 截断上下文都会偏。现在走真实词表（见 src/tokenizer.mjs）。
+ *
+ * tokenizer.json 读不到时（部署漏拷该文件）自动回退到旧的估算口径，
+ * 并且只尝试一次 —— 不让每条请求都去抛一次异常。
  */
+let tokenizerBroken = false;
+
 export function estimateTokens(text) {
   if (!text) return 0;
+  if (!tokenizerBroken) {
+    try {
+      return countTokens(text);
+    } catch {
+      tokenizerBroken = true;
+    }
+  }
+  return legacyEstimateTokens(text);
+}
+
+/** 旧口径（仅作回退）：中文按 1 字 1 token，其余按 4 字符 1 token */
+function legacyEstimateTokens(text) {
   let cjk = 0;
   let other = 0;
   for (const ch of text) {

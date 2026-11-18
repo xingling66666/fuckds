@@ -1,0 +1,15 @@
+2026/11/16-19:53:49.223 2008 Reusing MANIFEST /root/opends-freetoken/profile_ds/Default/Local Storage/leveldb/MANIFEST-000001
+2026/11/16-19:53:49.225 2008 Recovering log #33
+2026/11/16-19:53:49.228 2008 Reusing old log /root/opends-freetoken/profile_ds/Default/Local Storage/leveldb/000033.log 
+2026/11/16-19:54:49.240 2008 Level-0 table #37: started
+2026/11/16-19:54:49.268 2008 Level-0 table #37: 21256 bytes OK
+2026/11/16-19:54:49.282 2008 Delete type=0 #33
+2026/11/16-19:54:49.282 2008 Compacting 4@0 + 1@1 files
+2026/11/16-19:54:49.300 2008 Generated table #38@0: 30 keys, 12502 bytes
+2026/11/16-19:54:49.300 2008 Compacted 4@0 + 1@1 files => 12502 bytes
+2026/11/16-19:54:49.303 2008 compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/11/16-19:54:49.304 2008 Delete type=2 #27
+2026/11/16-19:54:49.304 2008 Delete type=2 #37
+2026/11/16-19:54:49.304 2008 Delete type=2 #30
+2026/11/16-19:54:49.304 2008 Delete type=2 #25
+2026/11/16-19:54:49.304 2008 Delete type=2 #34

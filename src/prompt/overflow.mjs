@@ -8,22 +8,82 @@ import { PromptTooLongError } from '../errors.mjs';
  * 网页版输入框单次最多 10 万字（超了接口直接报错）。但聊天接口的 `ref_file_ids`
  * 可以挂附件，而附件不占输入框长度，所以把「较早的内容」拆成一个 .txt 传上去：
  *
- *   正文 = # Messages: + 自带协议提示词（## System:）+ 附件说明 + 最近的段落
+ *   正文 = # Messages: + 自带协议提示词（协议段）+ 附件说明 + 最近的段落
  *   附件 = 较早的对话 / 工具声明 / 客户端 system（按原顺序）
  *
  * 拆分原则：
- * - 只切在 ## System / Tool_functions / User / Assistant / Tool_calls / Tool_call_result 段落边界上，
+ * - 只切在段落标签边界上（System / 工具声明 / User / Assistant / OTC / OTCR，新旧三代写法都认），
  *   不切碎单条消息；
- * - **自带协议提示词永远留在正文**：模型要先看到工具调用格式约定；
+ * - **自带协议提示词永远留在正文**：模型要先看到 DSML 调用格式约定；
  * - 保留**最新的**段落（真正要回答的问题在最后），较早的进附件；
- * - 空间不够时，连工具声明和客户端 system 提示也可以移进附件（先移最靠前的）；
+ * - 空间不够时，客户端 system 提示可以移进附件（先移最靠前的）；工具声明永不挪；
  * - 万一最后一段自己就超长，保留它的尾部，前面部分进附件；
  * - 正文再留一点余量（reserve），给重试时的额外约束文案用。
  */
 
-/** 段边界：## X: 前面那个换行属于上一段的结尾，切在这里 */
-const BLOCK_BOUNDARY = /\n## (System|Tool_functions|User|Assistant|Tool_calls|Tool_call_result):/g;
+/**
+ * 段落标签识别。
+ *
+ * 这里必须同时认三代写法，否则 prompt 格式一演进，超长上下文拆分就直接失效
+ * （曾经就是这样：段落从 `## System` 改成 `System` / `[User]:` 之后，
+ * splitBlocks 找不到任何边界，planOverflow 只能抛 413）。
+ *
+ *   旧版：  ## System / ## Tools / ## User / ## Assistant / ## OTC / ## OTCR
+ *   legacy：System / # 本次可用工具 / [User]: / [Assistant]:
+ *   stealth：System: / # 可用工具 / User: / Assistant:
+ */
+const LABEL_PATTERNS = [
+  /^##[ \t]*(System|Tool_functions|Tools|User|Assistant|Tool_calls|Tool_call_result|OTCR|OTC|FTCR|FTC)[ \t]*[:：]?$/,
+  /^\[(User|Assistant)\][ \t]*[:：]?$/,
+  /^(System|User|Assistant)[ \t]*[:：]?$/,
+  /^#[ \t]*(?:本次可用工具|可用工具)$/,
+];
+
+/** 一行是不是段落标签；是就返回归一前的段名 */
+function matchLabel(line) {
+  const text = line.trim();
+  if (!text) return null;
+  for (const pattern of LABEL_PATTERNS) {
+    const m = pattern.exec(text);
+    if (!m) continue;
+    if (pattern === LABEL_PATTERNS[3]) return 'Tools'; // "# 本次可用工具"
+    return m[1];
+  }
+  return null;
+}
+
+/**
+ * 扫描段边界：标签**独占一行、且上一行是空行**才算段落起点
+ * （正文里恰好有一行写着 "System" 不该被当成段）。
+ */
+function scanBoundaries(prompt) {
+  const starts = [];
+  let offset = 0;
+  let prevBlank = true;
+  for (;;) {
+    let lineEnd = prompt.indexOf('\n', offset);
+    const last = lineEnd === -1;
+    if (last) lineEnd = prompt.length;
+    const line = prompt.slice(offset, lineEnd);
+    if (prevBlank) {
+      const kind = matchLabel(line);
+      if (kind) starts.push({ index: offset, kind });
+    }
+    prevBlank = line.trim() === '';
+    if (last) break;
+    offset = lineEnd + 1;
+  }
+  return starts;
+}
 const DIALOG_KINDS = new Set(['User', 'Assistant', 'Tool_calls', 'Tool_call_result']);
+
+/** 把段落名归一成内部老名字（Tool_functions / Tool_calls / Tool_call_result），后面逻辑不用到处兼容 */
+function normalizeKind(kind) {
+  if (kind === 'Tools') return 'Tool_functions';
+  if (kind === 'OTC' || kind === 'FTC') return 'Tool_calls';
+  if (kind === 'OTCR' || kind === 'FTCR') return 'Tool_call_result';
+  return kind;
+}
 
 const DEFAULT_RESERVE = 1024;
 /** 正文里至少给最新对话留这么多字符，不够就把 system / 工具声明往附件挪 */
@@ -54,7 +114,7 @@ export function planOverflow(prompt, options = {}) {
     );
   }
 
-  const { header, headBlocks, protocol, dialogs } = parsed;
+  const { header, headBlocks, protocol, dialogs, trailing } = parsed;
   if (!dialogs.length) {
     throw new PromptTooLongError(
       `prompt 有 ${prompt.length} 字符，超过上限 ${maxChars}，且只有 system / 工具声明，没有可拆分的对话段落`,
@@ -159,7 +219,7 @@ export function planOverflow(prompt, options = {}) {
     .map((block) => block.text)
     .join('');
 
-  const inline = `${header}${inlineHeadText}${protocol.text}${note}${makeTail(name)}`;
+  const inline = `${header}${inlineHeadText}${protocol.text}${note}${makeTail(name)}${trailing.map((block) => block.text).join('')}`;
 
   if (inline.length > maxChars) {
     throw new PromptTooLongError(
@@ -184,20 +244,15 @@ export function planOverflow(prompt, options = {}) {
 
 /**
  * 把 prompt 切成「头部 + system/工具声明块 + 自带协议块 + 对话段」。
- * 自带协议块 = 第一个对话段之前、最后一个 ## System:（buildPrompt 固定把它放在这个位置）。
+ * 自带协议块 = 第一个对话段之前、最后一个 system 段（buildPrompt 固定把它放在这个位置）。
  */
 function splitBlocks(prompt) {
-  const starts = [];
-  BLOCK_BOUNDARY.lastIndex = 0;
-  let match;
-  while ((match = BLOCK_BOUNDARY.exec(prompt)) !== null) {
-    starts.push({ index: match.index, kind: match[1] });
-  }
+  const starts = scanBoundaries(prompt);
   if (!starts.length) return null;
 
   const header = prompt.slice(0, starts[0].index);
   const blocks = starts.map((item, i) => ({
-    kind: item.kind,
+    kind: normalizeKind(item.kind),
     text: prompt.slice(item.index, i + 1 < starts.length ? starts[i + 1].index : prompt.length),
   }));
 
@@ -213,12 +268,31 @@ function splitBlocks(prompt) {
   }
   if (protocolIndex === -1) return null;
 
+  /**
+   * 只有一个 system 段、而且它后面还跟着工具声明 —— 说明自带协议段被清空了
+   * （去特征的实验里 prompt 可以没有协议说明）。这时那个 system 是**客户端传入**的，
+   * 不能当成"协议块"：否则工具声明会被归进对话段落，超长时跟着被挪进附件，
+   * 模型就看不到工具 schema 了。
+   */
+  const noProtocol = protocolIndex === 0 && headEnd > 1;
+
+  // 最后一段工具结果后面可能还跟着一段 system（FINAL_ANSWER_HINT）：它不属于对话，
+  // 不能参与「保留最新段落」的挑选，否则最后一段工具结果会被整段挪进附件、尾部丢失。
+  const dialogs = firstDialog === -1 ? [] : blocks.slice(firstDialog);
+  const trailing = [];
+  while (dialogs.length && dialogs.at(-1).kind === 'System') {
+    trailing.unshift(dialogs.pop());
+  }
+
   return {
     header,
     // 协议块之前的 system / 工具声明（按原顺序；空块丢掉）
-    headBlocks: blocks.slice(0, protocolIndex).filter((block) => block.text.trim()),
-    protocol: blocks[protocolIndex],
-    dialogs: firstDialog === -1 ? [] : blocks.slice(firstDialog),
+    headBlocks: (noProtocol ? blocks.slice(0, headEnd) : blocks.slice(0, protocolIndex)).filter((block) =>
+      block.text.trim(),
+    ),
+    protocol: noProtocol ? { kind: 'System', text: '' } : blocks[protocolIndex],
+    dialogs,
+    trailing,
   };
 }
 
@@ -232,7 +306,7 @@ function buildNote(name, sections) {
     '',
     '## CONTEXT_ATTACHMENT:',
     `This context is long: the earlier ${sections} sections have been uploaded as attachment "${name}" (they may contain system prompts, tool declarations, or earlier conversation).`,
-    'The attachment uses the same ## section format as the main text (## System: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:).',
+    'The attachment uses the same section labels as the main text (System / User / Assistant / tool declarations).',
     'Read the attachment first, treat it as the earlier history of this conversation, then continue with the sections below. Do not mention the attachment or this note to the user.',
     '',
   ].join('\n');
@@ -247,7 +321,7 @@ function buildAttachmentTitle(sections) {
     '# Conversation history (earlier part)',
     '',
     `These are the earlier ${sections} sections of this conversation, moved to this file because they exceeded the web input length limit.`,
-    'Section format matches the main text: ## System: / ## Tool_functions: / ## User: / ## Assistant: / ## Tool_calls: / ## Tool_call_result:.',
+    'Section labels match the main text (System / User / Assistant / tool declarations).',
     '',
   ].join('\n');
 }

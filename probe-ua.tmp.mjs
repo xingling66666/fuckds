@@ -1,0 +1,10 @@
+import { chromium } from 'playwright';
+const b = await chromium.launch({ headless: false, args: ['--headless=new','--disable-blink-features=AutomationControlled'] });
+const ctx = await b.newContext({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36' });
+const page = await ctx.newPage();
+const reqs = [];
+page.on('request', (r) => { if (r.url().includes('/api/v0/')) reqs.push(r.headers()['sec-ch-ua']); });
+await page.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{});
+await page.waitForTimeout(4000);
+console.log('sec-ch-ua 样本:', JSON.stringify([...new Set(reqs)].slice(0,3)));
+await b.close();

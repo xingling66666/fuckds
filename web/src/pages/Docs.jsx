@@ -116,38 +116,40 @@ print(msg.content[0].text)`}
           </p>
           <CodeBlock
             code={`# Messages:
-## System:
+## System
 …客户端传入的 system…
-## Tool_functions:
-{"name":"exec_shell","description":"…","parameters":{…}}
-## System:
-…自带的特殊 token 声明 / 工具调用规范…
-## User:
+## Tools
+function exec_shell(pars) {
+  // Exec shell command
+  // pars: {"type":"object","properties":{"command":{"type":"string"}}}
+}
+## System
+…自带的特殊 token 声明 / OTML 工具调用规范…
+## User
 …历史用户消息…
-## Assistant:
-…模型历史回答… < | | END | | >
-## Tool_calls:
+## Assistant
+…模型历史回答…
+## OTC
 {"name":"exec_shell","args":{"command":"uname -a"}}
-## Tool_call_result:
+## OTCR
 {"name":"exec_shell","result":"Linux …"}
-## User:
+## User
 …要回答的问题（离生成位置最近）…`}
           />
           <p>
-            <strong>工具调用由模型按原生 DSML 格式输出</strong>，服务端解析成标准 <code>tool_calls</code> / <code>tool_use</code>，
-            并从 <code>content</code> / SSE 里剔除；历史里绝不回写 DSML，历史工具调用统一放在 <code>## Tool_calls</code> 段里。
+            <strong>工具调用由模型按 OTML（Opends Tool Call Language）输出</strong>：调用必须包在 <code>```otml</code> 围栏代码块里（块外代码按普通正文处理），
+            服务端解析成标准 <code>tool_calls</code> / <code>tool_use</code>，并从 <code>content</code> / SSE 里剔除；
+            历史里绝不回写 OTML，历史工具调用统一放在 <code>## OTC</code> 段里。
           </p>
           <CodeBlock
-            code={`<｜DSML｜ calls>
-    <｜DSML｜ invoke name="exec_shell">
-        <｜DSML｜ parameter name="command" string="true">uname -a</｜DSML｜ parameter>
-    </｜DSML｜ invoke>
-</｜DSML｜ calls>`}
+            code={`\`\`\`otml
+exec_shell({command:"uname -a", timeout:10});
+read_file({path:"/etc/hosts"});
+\`\`\``}
           />
           <p>
-            <strong>工具结果单独成段</strong>（<code>## Tool_call_result</code>），不并进 <code>## Assistant</code>，
-            模型没有可模仿的「自己写结果」样板。每轮回答末尾要求输出 <code>&lt; | | END | | &gt;</code>，
-            它只给模型看，不会出现在客户端内容里。
+            <strong>工具结果单独成段</strong>（<code>## OTCR</code>），不并进 <code>## Assistant</code>，
+            模型没有可模仿的「自己写结果」样板。旧格式（DSML / &lt;tool_call&gt; / 原生 token / 旧版 DO）仅作静默兜底解析。
           </p>
         </DocSection>
       </Card>
@@ -168,7 +170,7 @@ print(msg.content[0].text)`}
           <p>
             网页输入框单次上限约 10 万字。拼接后的 prompt 超限时，较早的对话会拆成一个 <code>context-*.txt</code> 附件，
             用 <code>ref_file_ids</code> 注入，正文保留最近的段落；正文里会放一段 <code>## CONTEXT_ATTACHMENT</code> 说明。
-            系统提示词和工具声明在空间不足时也可以拆进附件。
+            客户端 system 在空间不足时可以拆进附件；工具声明永不进附件，放不下会明确报错并提示改用 compact 模式。
           </p>
         </DocSection>
       </Card>
@@ -183,7 +185,7 @@ POST /admin/api/accounts          保存 token  {tokens, mode: append|replace}
 POST /admin/api/accounts/verify   校验登录态 {tokens}
 POST /admin/api/accounts/remove   删除已保存 token {index}
 GET  /admin/api/config            读取可改配置
-PUT  /admin/api/config            写回 .env {values}
+PUT  /admin/api/config            写入 SQLite data/config.db {values}，保存即生效
 GET  /admin/api/logs?lines=300    读日志尾部
 POST /admin/api/restart           重启服务`}
           />

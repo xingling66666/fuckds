@@ -8,8 +8,8 @@ import {
   readJsonObject,
   renderCompactToolDeclarations,
   renderToolDeclarations,
-  renderToolResult,
 } from '../src/prompt/tools.mjs';
+import { PUA_CHARS as PUA_C } from '../src/prompt/pua-tcl.mjs';
 
 test('parse: 基本 DO 调用', () => {
   const calls = parseToolCalls('好的，我来执行。\nDO:{"name":"exec_shell","args":"ls -la"}\n完成。');
@@ -48,7 +48,9 @@ test('parse: 线上抓到的 observe_screen 调用（名字没在声明里）必
   // 真实抓包：模型调了 observe_screen，但这一轮 tools 里没有这个名字。
   // 旧实现按名字丢弃 → content 和 tool_calls 双双为空 → 客户端「模型未返回正文或工具调用」。
   const text =
-    '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="observe_screen">\n<｜DSML｜ parameter name="include_ui_tree" string="false">true</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>';
+    `\n\n${PUA_C.TC_OPEN}${PUA_C.INVOKE}observe_screen` +
+    `${PUA_C.PARAM}include_ui_tree${PUA_C.JSON}${PUA_C.VALUE}true${PUA_C.PARAM_END}` +
+    `${PUA_C.END_INVOKE}${PUA_C.TC_CLOSE}`;
   const calls = parseToolCalls(text, ['launch_app', 'tap']);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].name, 'observe_screen');
@@ -86,21 +88,17 @@ test('readJsonObject: 找到配平的右括号', () => {
   assert.equal(readJsonObject(text, 2), '{"a":{"b":[1,2]},"c":"}"}');
 });
 
-test('render: 工具声明忽略没有名字的项', () => {
+test('render: 签名式声明，忽略没有名字的项', () => {
   const lines = renderToolDeclarations([
     { type: 'function', function: { name: 'a', description: 'A' } },
     { type: 'function', function: {} },
     { function: { name: 'b' } },
   ]);
-  assert.equal(lines.length, 2);
-  assert.equal(JSON.parse(lines[0]).name, 'a');
-  assert.equal(JSON.parse(lines[1]).name, 'b');
-});
-
-test('render: Tool_call_result 段的一行 JSON', () => {
-  const line = renderToolResult('exec_shell', 'Linux');
-  const parsed = JSON.parse(line);
-  assert.deepEqual(parsed, { name: 'exec_shell', result: 'Linux' });
+  assert.equal(lines.length, 2, '没有名字的工具要被跳过');
+  assert.equal(lines[0], 'a() — A');
+  assert.equal(lines[1], 'b()');
+  // 声明里不能再有 JSON
+  assert.ok(!lines.join('\n').includes('{'), '工具声明不应输出 JSON 结构');
 });
 
 test('normalizeArguments: 非 JSON 字符串会被包一层', () => {
@@ -126,92 +124,11 @@ test('parse: 被包成 {name,args} 的参数会自动拆开', () => {
   assert.deepEqual(JSON.parse(doString[0].arguments), { description: 'show cwd', command: 'pwd' });
 });
 
-test('parse: DSML 参数被命名成 name/args 时也能解析', () => {
-  const text = `<｜DSML｜calls>
-<｜DSML｜invoke name="bash">
-<｜DSML｜parameter name="name" string="true">bash</｜DSML｜parameter>
-<｜DSML｜parameter name="args" string="true">{"description":"show cwd","command":"pwd"}</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜calls>`;
-  const calls = parseToolCalls(text, ['bash']);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(calls[0].arguments), { description: 'show cwd', command: 'pwd' });
-});
-
 test('collectToolNames: 去空去重入参', () => {
   assert.deepEqual(
     collectToolNames([{ function: { name: 'a' } }, { function: { name: 'a' } }, { function: {} }, null]),
     ['a', 'a'],
   );
-});
-
-// ---------------------------------------------------------------- DSML
-
-const DSML_FULLWIDTH = `<｜DSML｜calls>
-<｜DSML｜invoke name="bash">
-<｜DSML｜parameter name="description" string="true">Show working directory</｜DSML｜parameter>
-<｜DSML｜parameter name="command" string="true">pwd; ls -la</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜calls>`;
-
-test('parse: DSML 全角竖线格式', () => {
-  const calls = parseToolCalls(`我来看看\n${DSML_FULLWIDTH}`, ['bash']);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, 'bash');
-  assert.deepEqual(JSON.parse(calls[0].arguments), {
-    description: 'Show working directory',
-    command: 'pwd; ls -la',
-  });
-});
-
-test('parse: DSML ASCII 竖线 / tool_calls / 双层竖线', () => {
-  const text = `<||DSML||tool_calls>
-<||DSML||invoke name='exec_shell'>
-<||DSML||parameter name="command" string="true">uname -a</||DSML||parameter>
-<||DSML||parameter name="timeout" string="false">15</||DSML||parameter>
-</||DSML||invoke>
-</||DSML||tool_calls>`;
-  const calls = parseToolCalls(text, ['exec_shell']);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, 'exec_shell');
-  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'uname -a', timeout: 15 });
-});
-
-test('parse: DSML 多个 invoke 且能按工具名过滤', () => {
-  const text = `<｜DSML｜calls>
-<｜DSML｜invoke name="exec_shell"><｜DSML｜parameter name="command">ls</｜DSML｜parameter></｜DSML｜invoke>
-<｜DSML｜invoke name="read_file"><｜DSML｜parameter name="path">/etc/hosts</｜DSML｜parameter></｜DSML｜invoke>
-</｜DSML｜calls>`;
-  const all = parseToolCalls(text);
-  assert.deepEqual(all.map((c) => c.name), ['exec_shell', 'read_file']);
-  // 传 knownTools 也不再过滤（回归：未声明的名字曾让整轮输出变空）
-  assert.deepEqual(parseToolCalls(text, ['read_file']).map((c) => c.name), ['exec_shell', 'read_file']);
-});
-
-test('parse: DSML 里的参数原样保留（含换行 / 引号）', () => {
-  const text = `<｜DSML｜calls>
-<｜DSML｜invoke name="bash">
-<｜DSML｜parameter name="command" string="true">printf '%s\\n' "a b" && echo done</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜calls>`;
-  const calls = parseToolCalls(text);
-  assert.equal(JSON.parse(calls[0].arguments).command, `printf '%s\\n' "a b" && echo done`);
-});
-
-test('parse: DSML 和 DO 混用不会重复', () => {
-  const text = `${DSML_FULLWIDTH}\nDO:{"name":"bash","args":{"command":"pwd; ls -la","description":"Show working directory"}}`;
-  const calls = parseToolCalls(text, ['bash']);
-  assert.equal(calls.length, 1);
-});
-
-test('parse: DSML 被截断（缺少闭合标签）也能解析出完整参数', () => {
-  const text = `<｜DSML｜calls>
-<｜DSML｜invoke name="bash">
-<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>
-`;
-  const calls = parseToolCalls(text, ['bash']);
-  assert.equal(calls.length, 1);
-  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'pwd' });
 });
 
 // ---------------------------------------------------------------- DO 容错
@@ -322,10 +239,9 @@ test('parse: 真·原生格式 function<sep>工具名 + JSON 参数也能解析'
   assert.deepEqual(JSON.parse(calls[0].arguments), { location: 'Hangzhou' });
 });
 
-test('parse: 原生 token / DSML / DO 混用不会重复', () => {
+test('parse: 原生 token / DO 混用不会重复', () => {
   const text = [
     '<|tool▁calls▁begin|>{"name":"exec_shell","arguments":{"command":"ls"}}<|tool▁calls▁end|>',
-    DSML_FULLWIDTH,
     'DO:{"name":"bash","args":{"command":"pwd; ls -la","description":"Show working directory"}}',
   ].join('\n');
   const calls = parseToolCalls(text, ['exec_shell', 'bash']);
@@ -350,7 +266,7 @@ test('compact: 一行一个工具，标出必填与类型', () => {
       },
     },
   ]);
-  assert.deepEqual(lines, ['bash(command:string*, timeout:number) — 执行 shell 命令']);
+  assert.deepEqual(lines, ['bash(command: text, timeout?: number) — 执行 shell 命令']);
 });
 
 test('compact: 没有参数也能渲染', () => {
@@ -383,4 +299,34 @@ test('compact: 体积远小于完整 JSON 声明', () => {
   const full = renderToolDeclarations(tools).join('\n').length;
   const compact = renderCompactToolDeclarations(tools).join('\n').length;
   assert.ok(compact * 5 < full, `压缩应至少省 80%，实际 ${compact}/${full}`);
+});
+
+/* ---------------------------------------------------------------- DSML（认，但不回写） */
+
+test('parse: DSML 全角竖线的调用能解析出来', () => {
+  const text = `我来看看\n<｜DSML｜calls>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜calls>`;
+  const calls = parseToolCalls(text, ['bash']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'bash');
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'pwd' });
+});
+
+test('parse: DSML 被截断（缺结束标签）也能解析出参数', () => {
+  const text = `<｜DSML｜calls>
+<｜DSML｜invoke name="bash">
+<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>`;
+  const calls = parseToolCalls(text, ['bash']);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(JSON.parse(calls[0].arguments), { command: 'pwd' });
+});
+
+test('parse: DSML 和 PUA 块不会重复解析同一次调用', () => {
+  const pua = `${PUA_C.TC_OPEN}${PUA_C.INVOKE}bash${PUA_C.PARAM}command${PUA_C.VALUE}pwd${PUA_C.PARAM_END}${PUA_C.END_INVOKE}${PUA_C.TC_CLOSE}`;
+  const dsml = `<｜DSML｜calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜calls>`;
+  const calls = parseToolCalls(`${dsml}\n${pua}`, ['bash']);
+  assert.equal(calls.length, 1, '同一次调用被两种格式写出来只保留一条');
 });

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { chromium } from 'playwright';
+import { loadPlaywright } from './playwright.mjs';
 
 import { installPageHelpers } from './page-scripts.mjs';
 import { buildLaunchEnv, resolveChromiumExecutable } from './env.mjs';
@@ -16,10 +16,65 @@ import {
   UpstreamError,
 } from '../errors.mjs';
 import { commonPrefixLength, sleep } from '../util.mjs';
+import { openTokenStore } from '../token-store.mjs';
 
-const NEW_CHAT_LABELS = ['开启新对话', '新对话', 'New chat', 'Start new chat'];
-const STOP_LABELS = ['停止生成', '停止', 'Stop generating', 'Stop'];
+/**
+ * 界面文案候选：网页会跟着 locale 变（中文 UI / 英文 UI 都见过）。
+ * 数组里两种语言都要留，否则哪天语言一变，自动化直接抛「找不到按钮」。
+ */
+const NEW_CHAT_LABELS = [
+  '开启新对话',
+  '新建对话',
+  '新对话',
+  'New chat',
+  'New Chat',
+  'Start new chat',
+];
+const STOP_LABELS = ['停止生成', '停止', 'Stop generating', 'Stop Generating', 'Stop'];
 const SEND_LABELS = ['发送', '发送消息', 'Send message', 'Send'];
+/** 深度思考 / 智能搜索开关的两种语言写法 */
+const THINKING_LABELS = ['深度思考', 'DeepThink', 'Deep Think', 'Thinking'];
+const SEARCH_LABELS = ['智能搜索', '联网搜索', 'Search', 'Web search', 'Web Search'];
+
+/** 后台展示 token 时用的掩码（与 admin 的 maskToken 同形态，前后各留 6 位） */
+function maskTokenValue(token) {
+  const text = String(token || '');
+  if (!text) return '(空)';
+  if (text.length <= 12) return `${text.slice(0, 3)}***`;
+  return `${text.slice(0, 6)}…${text.slice(-6)} (${text.length} 字符)`;
+}
+
+/**
+ * 按**实际 Chromium 版本**拼一个桌面 Chrome UA。
+ *
+ * 为什么不用写死的版本号：UA 里的版本和页面能读到的 `sec-ch-ua` 客户端提示
+ * 必须自洽，硬编码一个旧版本反而是更明显的破绽。这里用同一个大版本号，
+ * 并按当前系统补平台段，同时剥掉 `HeadlessChrome` 标记。
+ */
+export function desktopUserAgent(version) {
+  const major = String(version || '').split('.')[0] || '131';
+  const tail = `AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+  if (process.platform === 'win32') return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) ${tail}`;
+  if (process.platform === 'darwin') return `Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ${tail}`;
+  const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
+  return `Mozilla/5.0 (X11; Linux ${arch}) ${tail}`;
+}
+
+/**
+ * 页面里的语言兜底：有些站点不看请求头，直接用 `navigator.language` 决定文案，
+ * 所以连 JS 可见的字段也一起覆盖。
+ */
+function installLocale(locale) {
+  try {
+    Object.defineProperty(navigator, 'language', { get: () => locale, configurable: true });
+    Object.defineProperty(navigator, 'languages', {
+      get: () => [locale, locale.split('-')[0]],
+      configurable: true,
+    });
+  } catch {
+    /* 某些上下文不允许改，忽略 */
+  }
+}
 
 /**
  * Playwright 驱动 chat.deepseek.com。
@@ -42,10 +97,48 @@ export class DeepSeekWeb {
     this.closing = false;
     this.lastSendAt = 0;
     this.cooldownUntil = 0;
+    /** 主 token 的调用统计（后台账号表显示用，不参与调度） */
+    this.tokenStats = { requests: 0, limited: 0, errors: 0, lastError: null };
+    /** 主 token 是否被判为登录态失效（被服务端踢回 /sign_in） */
+    this.authFailed = false;
+    /** 页内直发传输（懒创建） */
+    this.net = null;
   }
 
   get baseUrl() {
     return this.config.deepseek.baseUrl;
+  }
+
+  /**
+   * 热切换号池：把新的 token 应用到运行中的浏览器，**不需要重启进程**。
+   *
+   * 做法：更新 config 里的 token，然后关掉当前浏览器——下一次请求会用新 token
+   * 重新创建上下文并注入 localStorage（addInitScript 在 context 创建时生效）。
+   */
+  reloadTokens(tokens) {
+    let list = Array.isArray(tokens) ? tokens.filter(Boolean) : null;
+    if (!list) {
+      // 后台保存号池 / 换号时只调 web.reloadTokens()：从数据库取当前号池
+      try {
+        const store = openTokenStore({ dataDir: this.config.dataDir });
+        list = store.list().map((row) => row.token);
+      } catch {
+        list = null;
+      }
+    }
+    const next = list && list.length ? list[list.length - 1] : null;
+    const prev = this.config.deepseek.token;
+    if (next && next !== prev) {
+      this.config.deepseek.token = next;
+      this.log?.info?.(`号池已热更新：切换到 ${String(next).slice(0, 6)}…（浏览器将重建）`);
+      this.close().catch(() => {});
+    }
+    return {
+      added: next && next !== prev ? 1 : 0,
+      removed: 0,
+      kept: next === prev ? 1 : 0,
+      total: list ? list.length : 1,
+    };
   }
 
   /* ------------------------------------------------------------------ *
@@ -72,6 +165,13 @@ export class DeepSeekWeb {
 
     const env = buildLaunchEnv(this.config, this.log);
     const executablePath = resolveChromiumExecutable(this.config);
+    const locale = this.config.browser.locale || 'zh-CN';
+    /**
+     * `--lang` 在这里**强制合并**，不依赖用户的 launchArgs / 系统环境：
+     * 界面文案一旦变成英文，自动登录和发送按钮的文案匹配就会直接报错。
+     * 用户 launchArgs 里自带的 --lang 会被丢掉，统一用配置里的 locale。
+     */
+    const userArgs = (this.config.browser.launchArgs || []).filter((arg) => !String(arg).startsWith('--lang'));
     const args = [
       '--no-sandbox',
       '--disable-dev-shm-usage',
@@ -81,14 +181,17 @@ export class DeepSeekWeb {
       '--mute-audio',
       '--no-first-run',
       '--no-default-browser-check',
-      ...this.config.browser.launchArgs,
+      ...userArgs,
+      `--lang=${locale}`,
     ];
 
     this.log.info('启动 Chromium…', {
       executable: executablePath ? path.basename(path.dirname(executablePath)) : '(playwright 默认)',
       headless: this.config.browser.headless,
+      locale,
     });
 
+    const { chromium } = await loadPlaywright();
     this.browser = await chromium.launch({
       headless: this.config.browser.headless,
       executablePath,
@@ -103,16 +206,23 @@ export class DeepSeekWeb {
       this.context = null;
     });
 
-    const { viewport, userAgent, locale } = this.config.browser;
+    const { viewport } = this.config.browser;
+    /** UA：配置里没写就按实际 Chromium 版本自动生成，保证和 sec-ch-ua 自洽 */
+    const userAgent = this.config.browser.userAgent || desktopUserAgent(this.browser.version());
     this.context = await this.browser.newContext({
-      viewport,
+      viewport: viewport || { width: 1440, height: 900 },
       userAgent,
       locale,
+      // 请求头也钉死一次：服务端和前端都可能按 Accept-Language 决定返回哪种文案
+      extraHTTPHeaders: { 'accept-language': `${locale},${locale.split('-')[0]};q=0.9` },
       timezoneId: process.env.TZ || 'Asia/Shanghai',
       deviceScaleFactor: 1,
     });
+    this.log.debug('浏览器上下文已创建', { locale, userAgent, viewport });
 
     await this.context.addInitScript(installPageHelpers);
+    // 页面按 JS 判断语言时也要看到中文（防 navigator.language 兜底识别）
+    await this.context.addInitScript(installLocale, locale);
     await this.context.addInitScript(
       ({ token }) => {
         try {
@@ -162,12 +272,60 @@ export class DeepSeekWeb {
       busy: this.slots.filter((s) => s.busy).length,
       queued: this.semaphore.pending,
       token: Boolean(this.config.deepseek.token),
+      /**
+       * 运行时号池：后台「当前进程里有没有可用账号」就看这个字段。
+       * 以前这里没有 accounts，admin 的 `status().accounts ?? []` 永远是空数组，
+       * 于是号池明明有 token，后台却一直显示「当前进程里没有可用账号」。
+       */
+      accounts: this.#accountsStatus(),
     };
+  }
+
+  /**
+   * 把 `config.deepseek.tokens` 摊成后台账号表要的形状。
+   *
+   * 字段对齐消费方（web/src/pages/Overview.jsx、Accounts.jsx）：
+   * index/token/available/authFailed/requests/limited/errors/cooldownMs/lastError。
+   * 当前浏览器引擎只用一个 token 发请求（主 token），其余号的状态保持默认值，
+   * 但**每一枚真实存在的 token 都要列出来**，不能凭空隐藏。
+   */
+  #accountsStatus() {
+    const tokens = [];
+    const configured = Array.isArray(this.config.deepseek?.tokens) ? this.config.deepseek.tokens : [];
+    for (const raw of configured) {
+      const value = typeof raw === 'string' ? raw.trim() : '';
+      if (value && !tokens.includes(value)) tokens.push(value);
+    }
+    const primary = this.config.deepseek?.token ? String(this.config.deepseek.token) : '';
+    // 主 token 必须在列表第一位：否则后台看到的号和实际发请求的号对不上
+    if (primary && tokens[0] !== primary) {
+      const rest = tokens.filter((t) => t !== primary);
+      tokens.length = 0;
+      tokens.push(primary, ...rest);
+    }
+
+    const cooldownMs = Math.max(0, (this.cooldownUntil || 0) - Date.now());
+    const stats = this.tokenStats;
+    return tokens.map((token, i) => {
+      const isPrimary = Boolean(primary) && token === primary;
+      return {
+        index: i + 1,
+        token: maskTokenValue(token),
+        // 浏览器引擎没有单独的「账号可用性」状态机：没冷却就是可用，被踢下线才置 authFailed
+        available: isPrimary ? !this.authFailed : true,
+        authFailed: isPrimary ? Boolean(this.authFailed) : false,
+        requests: isPrimary ? stats.requests : 0,
+        limited: isPrimary ? stats.limited : 0,
+        errors: isPrimary ? stats.errors : 0,
+        cooldownMs: isPrimary ? cooldownMs : 0,
+        lastError: isPrimary ? stats.lastError : null,
+      };
+    });
   }
 
   /** 浏览器引擎不支持图片输入（直连引擎才走附件上传） */
   async uploadImages() {
-    throw new ApiError(400, '图片输入只支持直连引擎：请设置 ENGINE=direct 并执行 npm run pow:build', {
+    throw new ApiError(400, '当前引擎不支持图片输入：图片需在网页里手动上传', {
       code: 'image_not_supported',
     });
   }
@@ -175,7 +333,7 @@ export class DeepSeekWeb {
   /** 浏览器引擎也不支持把超长上下文转附件；只能直连 */
   async uploadAttachments() {
     throw new PromptTooLongError(
-      '上下文超过输入框上限，需要转成附件，但浏览器引擎不支持附件上传：请设置 ENGINE=direct，或减少上下文',
+      '上下文超过输入框上限：请减少上下文（浏览器里无法自动转附件）',
     );
   }
 
@@ -307,6 +465,22 @@ export class DeepSeekWeb {
       if (st?.captcha) throw new CaptchaError('登录页出现人机验证，无法自动完成');
       if (st?.signedIn && st.inputVisible) return;
       if (st && !st.signedIn) {
+        /**
+         * token 失效时服务端会把人踢到 /sign_in。以前这里只是继续等，
+         * 一直磨到 navigationTimeout（60s 起）才报错，客户端那边表现为「请求挂着不返回」。
+         * 现在只要看到登录页 URL 就立刻抛 AuthExpiredError。
+         */
+        const url = page.url();
+        if (url.includes('/sign_in') || url.includes('/sign_up')) {
+          /**
+           * 不再有「真人档案」这条链路（整包 localStorage 导入已砍掉），
+           * 所以这里只有一种成因：token 本身失效 / 被风控踢下线。
+           */
+          throw new AuthExpiredError(
+            `被服务端踢回登录页（${url.replace('https://chat.deepseek.com', '')}）：token 已失效或被吊销，` +
+              '请重新执行 `npm run auth -- <userToken>`，或在后台「账号」页粘贴新的 userToken',
+          );
+        }
         await sleep(300);
         continue;
       }
@@ -362,8 +536,11 @@ export class DeepSeekWeb {
     const MAX_ATTEMPTS = 3;
     for (let n = 1; ; n += 1) {
       try {
-        return await attempt(n);
+        const result = await attempt(n);
+        this.#recordSuccess();
+        return result;
       } catch (err) {
+        this.#recordFailure(err);
         if (signal?.aborted) throw err;
 
         const isRateLimit = err instanceof RateLimitError || err.code === 'deepseek_rate_limited';
@@ -385,6 +562,24 @@ export class DeepSeekWeb {
         }
       }
     }
+  }
+
+  /** 主 token 的成功统计：后台账号表能看到「请求数」真的在动 */
+  #recordSuccess() {
+    this.tokenStats.requests += 1;
+    this.authFailed = false;
+    this.tokenStats.lastError = null;
+  }
+
+  /** 失败统计：限流 / 其它错误分开记，登录态失效单独标注 */
+  #recordFailure(err) {
+    if (err instanceof RateLimitError || err?.code === 'deepseek_rate_limited') {
+      this.tokenStats.limited += 1;
+    } else {
+      this.tokenStats.errors += 1;
+    }
+    if (err instanceof AuthExpiredError) this.authFailed = true;
+    this.tokenStats.lastError = String(err?.message || err || '').slice(0, 200) || null;
   }
 
   async #prepare(page, { thinking, search }) {
@@ -411,8 +606,9 @@ export class DeepSeekWeb {
     const tNewChatDone = Date.now();
 
     // 网页会记住上次的开关状态，这里强制对齐请求意图（默认关掉联网搜索，保证速度）
-    await this.#maybeToggle(page, '深度思考', Boolean(thinking));
-    await this.#maybeToggle(page, '智能搜索', Boolean(search));
+    // 页面语言会变：中文 UI 是「深度思考 / 智能搜索」，英文 UI 是 DeepThink / Search，两种都试
+    await this.#maybeToggle(page, THINKING_LABELS, Boolean(thinking));
+    await this.#maybeToggle(page, SEARCH_LABELS, Boolean(search));
 
     this.log.debug('prepare 分解', {
       newChatMs: tNewChatDone - tNewChat,
@@ -447,10 +643,29 @@ export class DeepSeekWeb {
   async #maybeToggle(page, label, desired) {
     if (!this.config.deepseek.manageToggles) return;
     try {
+      // 开关是异步渲染的：新对话刚切过去时可能还没出现，先等它挂上再点
+      await page
+        .waitForFunction(
+          (labels) =>
+            [...document.querySelectorAll('.ds-toggle-button')].some((el) => {
+              const text = el.textContent || '';
+              return (Array.isArray(labels) ? labels : [labels]).some((item) => text.includes(item));
+            }),
+          Array.isArray(label) ? label : [label],
+          { timeout: 5_000 },
+        )
+        .catch(() => {});
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const state = await page.evaluate((text) => window.__DSW__.toggleState(text), label);
         if (!state?.found) {
-          this.log.debug(`没有找到开关「${label}」，跳过`);
+          const diag = await page
+            .evaluate(() => ({
+              url: location.href,
+              count: document.querySelectorAll('.ds-toggle-button').length,
+              texts: [...document.querySelectorAll('.ds-toggle-button')].map((el) => (el.textContent || '').trim().slice(0, 12)),
+            }))
+            .catch(() => null);
+          this.log.debug(`没有找到开关「${label}」，跳过`, diag);
           return;
         }
         if (state.selected === Boolean(desired)) {
@@ -486,7 +701,9 @@ export class DeepSeekWeb {
     await page.keyboard.press('ControlOrMeta+A');
     await page.keyboard.insertText(prompt);
 
-    const expected = Math.min(prompt.length, 32);
+    const outgoing = prompt;
+
+    const expected = Math.min(outgoing.length, 32);
     await page
       .waitForFunction(
         (min) => {
@@ -503,11 +720,75 @@ export class DeepSeekWeb {
       });
 
     const before = await this.#state(page);
-    await page.keyboard.press('Enter');
+    // 优先真实点击发送按钮（CDP 鼠标 → isTrusted=true）；点完确认没发出去才退 Enter
+    const clicked = await this.#clickSendButton(page);
+    if (clicked) {
+      await sleep(700);
+      const st = await this.#state(page).catch(() => null);
+      const stillTyped = Boolean(st?.inputValue && st.inputValue.trim());
+      const notStarted = !st || st.assistantCount <= before.assistantCount;
+      if (stillTyped && notStarted) {
+        this.log.debug('点击发送没生效，退回 Enter');
+        await page.keyboard.press('Enter');
+      }
+    } else {
+      this.log.debug('没找到发送按钮，退回 Enter');
+      await page.keyboard.press('Enter');
+    }
     this.lastSendAt = Date.now();
 
     const sent = await this.#confirmSent(page, before);
     if (!sent) throw new UpstreamError('消息未能发送（可能触发风控或输入过长）', { code: 'send_failed' });
+  }
+
+  /** 真实点击发送按钮：先按角色，再按 aria-label / 图标容器找 */
+  async #clickSendButton(page) {
+    const box = await page
+      .evaluate((labels) => {
+        const textok = (el) => {
+          const t = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('title'))) || el.textContent || '';
+          return labels.some((l) => String(t).trim() === l || String(t).includes(l));
+        };
+        const nodes = [...document.querySelectorAll('button,[role=button],div.ds-button,[class*=send]')];
+        const cand = nodes.filter((el) => el.offsetParent !== null && textok(el));
+        for (const el of cand) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 8 && r.height > 8) return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+        }
+        // 退化：输入框右下角的圆形按钮
+        const ta = document.querySelector('textarea');
+        if (ta) {
+          const r = ta.getBoundingClientRect();
+          return { x: r.x + r.width - 28, y: r.y + r.height - 28, guess: true };
+        }
+        return null;
+      }, SEND_LABELS)
+      .catch(() => null);
+    if (!box) return false;
+    await page.mouse.move(box.x - 40, box.y - 26);
+    await page.waitForTimeout(60 + Math.random() * 60);
+    await page.mouse.move(box.x - 8, box.y - 5);
+    await page.waitForTimeout(40 + Math.random() * 50);
+    await page.mouse.click(box.x, box.y);
+    return true;
+  }
+
+  /** 开一个临时页面（登录自动化用；用完自己 close） */
+  async newPage() {
+    await this.ensureStarted();
+    const page = await this.context.newPage();
+    page.setDefaultTimeout(30_000);
+    return page;
+  }
+
+  /** 探活：打开页面看登录态是否还在（后台「体检」用，只读） */
+  async probe() {
+    try {
+      const r = await this.checkLogin();
+      return { alive: Boolean(r.ok), code: r.ok ? 0 : 40003, msg: r.ok ? '' : `被踢回登录页（${r.url || 'sign_in'}）` };
+    } catch (err) {
+      return { alive: false, code: null, msg: err.message };
+    }
   }
 
   async #confirmSent(page, before) {
@@ -525,7 +806,7 @@ export class DeepSeekWeb {
 
       // 兜底：点一次发送按钮
       if (Date.now() > deadline - 15_000) {
-        await page.evaluate((labels) => window.__DSW__.clickByTexts(labels), SEND_LABELS).catch(() => {});
+        await this.#clickSendButton(page).catch(() => {});
       }
       await sleep(60);
     }
@@ -830,7 +1111,7 @@ export class DeepSeekWeb {
       if (st.rateLimited) throw new RateLimitError();
       if (st.notice) {
         if (/过长|too long/i.test(st.notice)) throw new PromptTooLongError(st.notice);
-        if (/正在生成|稍后再试/i.test(st.notice)) {
+        if (/正在生成|稍后再试|still generating|try again later/i.test(st.notice)) {
           throw new UpstreamError(`页面提示：${st.notice}`, { code: 'page_busy' });
         }
       }

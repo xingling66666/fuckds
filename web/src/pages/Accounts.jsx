@@ -32,6 +32,12 @@ export default function Accounts() {
   const [verifyResults, setVerifyResults] = useState(null);
   const [pendingRestart, setPendingRestart] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  // 手动过验证注册（VNC）
+  // 自动登录（真浏览器 → 密码 → 数美点选 → 邮箱验证码）
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginStatus, setLoginStatus] = useState(null);
+  const [loginStarting, setLoginStarting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -45,6 +51,48 @@ export default function Accounts() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // 自动登录状态轮询
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const st = await adminApi('/login/status');
+        if (!stop) setLoginStatus(st);
+        if (st?.state === 'ok') load();
+      } catch {
+        /* ignore */
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 3000);
+    return () => {
+      stop = true;
+      clearInterval(timer);
+    };
+  }, [load]);
+
+  const startLogin = async () => {
+    if (!loginEmail.trim() || !loginPassword) {
+      toast('填邮箱和密码（或先在 .env 配 DS_EMAIL / DS_PASSWORD）');
+      return;
+    }
+    setLoginStarting(true);
+    try {
+      await adminApi('/login', { method: 'POST', body: { email: loginEmail.trim(), password: loginPassword } });
+      notify('已开始登录，页面会自动填表/过验证码/收邮件');
+      setLoginStatus({ state: 'running' });
+    } catch (err) {
+      toast(err.message);
+    } finally {
+      setLoginStarting(false);
+    }
+  };
+
+  const cancelLogin = async () => {
+    await adminApi('/login/cancel', { method: 'POST', body: {} }).catch(() => {});
+    setLoginStatus((s) => ({ ...(s || {}), state: 'cancelled' }));
+  };
 
   const verify = async () => {
     if (!input.trim()) {
@@ -135,6 +183,39 @@ export default function Accounts() {
   const runtime = data?.runtime ?? [];
   const saved = data?.saved ?? [];
 
+  const revoke = async (item) => {
+    const ok = await askConfirm(`把第 ${item.index} 个号标记为「已吊销」？打标后它不会再被选中，也不会再发请求去试探。`, '标记吊销', '标记');
+    if (!ok) return;
+    try {
+      await adminApi('/accounts/revoke', { method: 'POST', body: { index: item.index } });
+      toast('已标记吊销');
+      await load();
+    } catch (err) {
+      toast(`操作失败：${err.message}`);
+    }
+  };
+
+  const restore = async (item) => {
+    try {
+      await adminApi('/accounts/restore', { method: 'POST', body: { index: item.index } });
+      toast('已解除吊销');
+      await load();
+    } catch (err) {
+      toast(`操作失败：${err.message}`);
+    }
+  };
+
+  const movePool = async (item, pool) => {
+    try {
+      const res = await adminApi('/accounts/pool', { method: 'POST', body: { index: item.index, pool } });
+      toast(pool === 'solver' ? '已移到解题池' : '已移回主池');
+      await load();
+      if (res?.poolCounts) toast(`主池 ${res.poolCounts.main} · 解题池 ${res.poolCounts.solver}`);
+    } catch (err) {
+      toast(`移动失败：${err.message}`);
+    }
+  };
+
   return (
     <div className="page">
       <div className="page-head">
@@ -168,7 +249,68 @@ export default function Accounts() {
         </Banner>
       ) : null}
 
-      <Card title="添加 / 更新 token" subtitle="粘贴后可以先校验登录态，再保存">
+      <Card
+        title="自动登录（真浏览器）"
+        subtitle="自动填表 → 点「登录」→ 数美点选由 CV 识别点击 → 邮箱验证码自动收取 → token 落盘"
+        actions={
+          <div className="row">
+            <Btn variant="outlined" onClick={cancelLogin} disabled={!loginStatus || loginStatus.state !== 'running'}>
+              取消
+            </Btn>
+            <Btn variant="filled" loading={loginStarting} onClick={startLogin}>
+              自动登录
+            </Btn>
+          </div>
+        }
+      >
+        <div className="stack">
+          <TextField
+            label="邮箱"
+            placeholder="you@gmail.com"
+            value={loginEmail}
+            onChange={setLoginEmail}
+            helper="留空则用 .env 里的 DS_EMAIL"
+          />
+          <TextField
+            label="密码"
+            type="password"
+            togglePassword
+            placeholder="账号密码"
+            value={loginPassword}
+            onChange={setLoginPassword}
+            helper="留空则用 .env 里的 DS_PASSWORD（不会写进日志）"
+          />
+          {loginStatus && loginStatus.state !== 'idle' ? (
+            <Banner
+              tone={
+                loginStatus.state === 'ok'
+                  ? 'ok'
+                  : loginStatus.state === 'error'
+                    ? 'error'
+                    : 'info'
+              }
+            >
+              <div>
+                状态：<b>{loginStatus.state}</b>
+                {loginStatus.result?.deviceId ? `　设备：${loginStatus.result.deviceId}` : ''}
+              </div>
+              {loginStatus.error ? <div style={{ marginTop: 6 }}>错误：{loginStatus.error}</div> : null}
+              {loginStatus.state === 'ok' && loginStatus.result?.token ? (
+                <div style={{ marginTop: 6 }}>✅ token 已写入号池：{loginStatus.result.token}</div>
+              ) : null}
+            </Banner>
+          ) : null}
+          {loginStatus && loginStatus.state === 'running' ? (
+            <img
+              alt="登录过程画面"
+              src={`/admin/api/login/screenshot?t=${Date.now()}`}
+              style={{ maxWidth: '100%', border: '1px solid #e5e7eb', borderRadius: 8 }}
+            />
+          ) : null}
+        </div>
+      </Card>
+
+      <Card title="添加 / 更新 token" subtitle="只支持直接填 userToken；粘贴后可以先校验登录态，再保存">
         <div className="stack">
           <TextField
             label="userToken（可多行）"
@@ -176,7 +318,7 @@ export default function Accounts() {
             rows={4}
             value={input}
             onChange={setInput}
-            helper="多个 token 用换行、空格或逗号分隔都可以"
+            helper="从 chat.deepseek.com 的 F12 → Application → Local Storage 里复制 userToken 的 value 填这里"
           />
           <div className="row">
             <Select value={mode} onChange={setMode} options={MODE_OPTIONS} style={{ width: 220 }} />
@@ -218,7 +360,7 @@ export default function Accounts() {
 
       <Card
         title={`已保存的 token（${data?.savedCount ?? saved.length} 个）`}
-        subtitle="data/auth.json · 重启服务后加载进号池"
+        subtitle={`可用 ${data?.poolCounts?.usable ?? '—'} 个（主池 ${data?.poolCounts?.main ?? '—'} · 解题池 ${data?.poolCounts?.solver ?? '—'}）· 已吊销 ${data?.poolCounts?.revoked ?? 0} 个`}
       >
         {saved.length ? (
           <div className="table-wrap">
@@ -227,6 +369,8 @@ export default function Accounts() {
                 <tr>
                   <th>#</th>
                   <th>Token</th>
+                  <th>池</th>
+                  <th>状态</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -236,6 +380,36 @@ export default function Accounts() {
                     <td className="numeric">{item.index}</td>
                     <td className="mono">{item.token}</td>
                     <td>
+                      <Chip tone={item.pool === 'solver' ? 'warn' : 'ok'}>
+                        {item.pool === 'solver' ? '解题池' : '主池'}
+                      </Chip>
+                    </td>
+                    <td>
+                      {item.status === 'revoked' ? (
+                        <Chip tone="error" title={item.revokedReason || ''}>已吊销</Chip>
+                      ) : (
+                        <Chip tone="ok">可用</Chip>
+                      )}
+                    </td>
+                    <td>
+                      <IconBtn
+                        icon={item.pool === 'solver' ? 'swap_horiz' : 'psychology'}
+                        title={item.pool === 'solver' ? '移回主池' : '移到解题池（只答验证码，不参与业务）'}
+                        onClick={() => movePool(item, item.pool === 'solver' ? 'main' : 'solver')}
+                      />
+                      {item.status === 'revoked' ? (
+                        <IconBtn
+                          icon="restart_alt"
+                          title="解除吊销（确认这个号又能用了再点）"
+                          onClick={() => restore(item)}
+                        />
+                      ) : (
+                        <IconBtn
+                          icon="block"
+                          title="标记吊销（打标后不再参与选号，不需要轮询）"
+                          onClick={() => revoke(item)}
+                        />
+                      )}
                       <IconBtn
                         icon="delete_outline"
                         title="从号池删除"
@@ -269,6 +443,7 @@ export default function Accounts() {
                   <th>错误数</th>
                   <th>冷却</th>
                   <th>最近错误</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -290,6 +465,13 @@ export default function Accounts() {
                     <td className="numeric">{account.errors}</td>
                     <td className="numeric">{account.cooldownMs ? formatMs(account.cooldownMs) : '—'}</td>
                     <td className="muted">{account.lastError || '—'}</td>
+                    <td>
+                      <IconBtn
+                        icon="delete_outline"
+                        title="从号池删除"
+                        onClick={() => remove(account.index)}
+                      />
+                    </td>
                   </tr>
                 ))}
               </tbody>

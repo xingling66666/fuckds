@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 
 import { ApiError } from './errors.mjs';
@@ -58,11 +59,27 @@ export function createServer({ config, logger, web }) {
 
     try {
       if (req.method === 'GET' && (url.pathname === '/healthz' || url.pathname === '/health')) {
+        /**
+         * /healthz 是**公开**接口（不加鉴权），所以只报概括状态：
+         * 引擎、并发、号池有几个 / 几个可用、登录态是否正常。
+         * 号池明细（打码 token、每号的请求数 / 冷却 / 错误）只在带 key 的 /admin/api 里出。
+         */
+        const st = web.status?.() ?? {};
+        const accounts = Array.isArray(st.accounts) ? st.accounts : [];
         return sendJson(res, 200, {
           ok: true,
           pid: process.pid,
           uptime_s: Math.round(process.uptime()),
-          ...web.status(),
+          engine: st.engine,
+          mode: st.mode,
+          browser: st.browserActive ?? st.browser ?? false,
+          pages: st.pages ?? 0,
+          busy: st.busy ?? 0,
+          queued: st.queued ?? 0,
+          token: Boolean(st.token),
+          accounts: accounts.length,
+          accountsAvailable: accounts.filter((a) => a && a.available !== false && !a.authFailed).length,
+          login: st.login ? { ok: Boolean(st.login.ok), at: st.login.at ?? null, via: st.login.via ?? null } : null,
           version: 1,
         });
       }
@@ -138,8 +155,36 @@ export function createServer({ config, logger, web }) {
    * /v1/chat/completions
    * ------------------------------------------------------------------ */
 
+  /** 会话提示：优先显式头/字段，其次按客户端 IP 隔离（多人共用时必须给，见 README） */
+  function conversationHintOf(req, request) {
+    const header = (name) => {
+      const v = req?.headers?.[name];
+      return Array.isArray(v) ? v[0] : v;
+    };
+    const explicit =
+      header('x-conversation-id') ||
+      header('x-session-id') ||
+      request?.conversation_id ||
+      request?.metadata?.conversation_id ||
+      request?.metadata?.session_id ||
+      null;
+    if (explicit) return String(explicit);
+    // 没给就用「API key + 来源 IP」做隔离。
+    // 只靠 IP 不行：中转站前面常挂反代，所有用户都是同一个 IP；
+    // 再加上 API key 的哈希，才能真正区分调用方（防上下文串号 → 防私钥泄露）。
+    const fwd = header('x-forwarded-for');
+    const ip = (fwd ? String(fwd).split(',')[0] : '') || req?.socket?.remoteAddress || 'unknown';
+    const auth = String(req?.headers?.authorization || '');
+    const keyRaw = auth.startsWith('Bearer ') ? auth.slice(7).trim() : String(req?.headers?.['x-api-key'] || '');
+    const keyTag = keyRaw
+      ? crypto.createHash('sha256').update(keyRaw).digest('hex').slice(0, 16)
+      : 'nokey';
+    return `caller:${keyTag}:ip:${ip}`;
+  }
+
   async function handleChat(req, res, request) {
     const id = newCompletionId();
+    const conversationHint = conversationHintOf(req, request);
 
     const abort = new AbortController();
     res.on('close', () => {
@@ -152,7 +197,8 @@ export function createServer({ config, logger, web }) {
         model: request.model,
         thinking: request.thinking,
         stream: request.stream,
-        promptChars: prompt.length,
+        // 注意：这里是**本地拼出来的全量 prompt**；真正发给上游的体积见「实发」字段
+        fullPromptChars: prompt.length,
         originalChars: info.stats?.chars,
         attachmentChars: info.attachment?.chars ?? 0,
         sections: info.stats?.sections,
@@ -160,7 +206,7 @@ export function createServer({ config, logger, web }) {
       });
 
     if (!request.stream) {
-      const result = await runChat(request, { signal: abort.signal, meta: { id }, onPrompt });
+      const result = await runChat(request, { signal: abort.signal, meta: { id, conversationHint }, onPrompt });
       const payload = buildChatCompletion({
         id,
         model: request.model,
@@ -170,9 +216,20 @@ export function createServer({ config, logger, web }) {
         finishReason: result.toolCalls.length ? 'tool_calls' : 'stop',
         usage: estimateUsage(result.prompt, result.text, result.reasoning),
       });
+      if (request.thinking && !(result.reasoning || '').trim()) {
+        log.warn('开启了深度思考但这一轮没有返回思考内容（多半是上游没吐 THINK 片段）', {
+          id,
+          model: request.model,
+          chars: result.text.length,
+        });
+      }
       log.info('完成', {
         id,
+        upstreamPromptChars: result.upstreamPromptChars,
+        fullPromptChars: result.fullPromptChars,
+        continuous: result.continuous,
         chars: result.content.length,
+        reasoningChars: (result.reasoning || '').length,
         ms: result.elapsedMs,
         toolCalls: result.toolCalls.length,
         fabricated: result.fabricated,
@@ -287,9 +344,21 @@ export function createServer({ config, logger, web }) {
         });
       }
 
+      if (request.thinking && !(result.reasoning || '').trim()) {
+        log.warn('开启了深度思考但这一轮没有返回思考内容（多半是上游没吐 THINK 片段）', {
+          id,
+          model: request.model,
+          chars: result.text.length,
+        });
+      }
       log.info('流式完成', {
         id,
+        // 真正发给上游的 prompt 体积（续聊时远小于本地全量）
+        upstreamPromptChars: result.upstreamPromptChars,
+        fullPromptChars: result.fullPromptChars,
+        continuous: result.continuous,
         chars: result.text.length,
+        reasoningChars: (result.reasoning || '').length,
         sentChars: sentContent.length,
         finalChars: result.content.length,
         streamConsistent,
@@ -315,7 +384,7 @@ export function createServer({ config, logger, web }) {
       if (!res.writableEnded) abort.abort();
     });
 
-    const result = await runChat(request, { signal: abort.signal, meta: { id } });
+    const result = await runChat(request, { signal: abort.signal, meta: { id, conversationHint: conversationHintOf(req, request) } });
 
     if (!request.stream) {
       return sendJson(res, 200, {
@@ -384,7 +453,7 @@ th{background:#f6f8fa}
 <tr><td><code>GET /v1/models</code></td><td>模型列表</td></tr>
 <tr><td><code>GET /healthz</code></td><td>健康检查 / 浏览器状态</td></tr>
 </table>
-<p>每条消息都会新开一个 DeepSeek 网页对话，历史上下文拼在同一个 prompt 里（<code>## User</code> / <code>## Assistant</code> / <code>## Tool_calls</code> / <code>## Tool_call_result</code>）；工具调用由模型按原生 DSML 输出，服务端解析成标准 <code>tool_calls</code>。</p>
+<p>每条消息都会新开一个 DeepSeek 网页对话，历史上下文拼在同一个 prompt 里（<code>System</code> / <code>User:</code> / <code>Assistant:</code> 段落）；工具调用由模型按 <code>DSML</code>（网页版原生的 XML 风格块：<code>calls / invoke / parameter</code>）输出，服务端解析成标准 <code>tool_calls</code>。</p>
 <pre>${escapeHtml(example)}</pre>
 <pre>${escapeHtml(anthropicExample)}</pre>
 <p style="color:#6b7280">登录态：${config.deepseek.token ? '已配置 ✅' : '未配置 ❌ 执行 npm run auth -- &lt;userToken&gt;'}</p>

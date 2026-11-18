@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 
 import { createServer } from '../src/server.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { makeConfig } from './helpers/browser.mjs';
+import { makeConfig } from './helpers/config.mjs';
+import { SECTION, TOOL_RECORD } from '../src/prompt/special.mjs';
+const PUA_C = Object.fromEntries(
+  ['TC_OPEN','TC_CLOSE','INVOKE','END_INVOKE','PARAM','VALUE','PARAM_END','ESC','STRING','JSON']
+    .map((name, i) => [name, String.fromCharCode(0xe000 + i)]),
+);
 
 const logger = createLogger('error');
 
@@ -26,10 +31,13 @@ function fakeWeb({
     uploads: [],
     lastPrompt: '',
     lastFileIds: [],
+    attachmentText: '',
     status: () => ({ browser: true, token: true }),
     async uploadAttachments(files = []) {
       const base = web.uploads.length;
       web.uploads.push(...files.map((f) => f.name));
+      // 正文整包进附件：真正的 prompt 内容在这里，不在 lastPrompt
+      web.attachmentText = files.map((f) => (f.buffer ? f.buffer.toString('utf8') : '')).join('\n');
       return files.map((_, i) => `file_${base + i}`);
     },
     async uploadImages(images = []) {
@@ -57,7 +65,12 @@ function fakeWeb({
 }
 
 async function withServer(opts, fn) {
-  const config = makeConfig({ API_KEY: opts.apiKey ?? '', ...(opts.env ?? {}) });
+  // Anthropic 这套用例断言的是"正文进了附件"（attachmentText），所以这里默认开启
+  const config = makeConfig({
+    API_KEY: opts.apiKey ?? '',
+    PROMPT_AS_ATTACHMENT: 'true',
+    ...(opts.env ?? {}),
+  });
   const server = createServer({ config, logger, web: opts.web ?? fakeWeb() });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -127,9 +140,9 @@ test('Anthropic：system 顶层字段和块数组都会进 prompt', async () => 
       }),
     );
     assert.equal(res.status, 200);
-    assert.match(web.lastPrompt, /你是严谨的助手/);
-    assert.match(web.lastPrompt, /回答简短/);
-    assert.match(web.lastPrompt, /介绍一下自己/);
+    assert.match(web.attachmentText, /你是严谨的助手/);
+    assert.match(web.attachmentText, /回答简短/);
+    assert.match(web.attachmentText, /介绍一下自己/);
   });
 });
 
@@ -149,14 +162,16 @@ test('Anthropic：messages 里的 system 角色也接受（客户端常见写法
     assert.equal(res.status, 200, 'system 在 messages 里不该报 400');
     const json = await res.json();
     assert.equal(json.type, 'message');
-    assert.match(web.lastPrompt, /你是严谨的助手/);
-    assert.match(web.lastPrompt, /介绍一下自己/);
+    assert.match(web.attachmentText, /你是严谨的助手/);
+    assert.match(web.attachmentText, /介绍一下自己/);
   });
 });
 
 test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', async () => {
   const web = fakeWeb({
-    toolText: '先看内核：\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_shell">\n<｜DSML｜ parameter name="command" string="true">uname -a</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>',
+    toolText:
+      '先看内核：\n' +
+      `${PUA_C.TC_OPEN}${PUA_C.INVOKE}exec_shell${PUA_C.PARAM}command${PUA_C.VALUE}uname -a${PUA_C.PARAM_END}${PUA_C.END_INVOKE}${PUA_C.TC_CLOSE}`,
   });
   await withServer({ web }, async (base) => {
     const res = await post(
@@ -182,12 +197,12 @@ test('Anthropic tools：tool_use 块 + input 是对象，stop_reason=tool_use', 
     assert.ok(call.id.startsWith('toolu_'));
 
     // 工具声明要进 prompt，且是 input_schema 转换后的 JSON Schema
-    assert.match(web.lastPrompt, /exec_shell/);
-    assert.match(web.lastPrompt, /"command"/);
+    assert.match(web.attachmentText, /exec_shell/);
+    assert.match(web.attachmentText, /command\??: text/);
 
-    // 正文块里不能出现 DSML 调用语法
+    // 正文块里不能出现控制字符（调用块必须被剥掉）
     const text = json.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
-    assert.ok(!text.includes('DSML'), `正文漏了 DSML: ${text}`);
+    assert.ok(!/[\uE000-\uE009]/.test(text), `正文漏了控制字符: ${JSON.stringify(text)}`);
   });
 });
 
@@ -225,15 +240,21 @@ test('Anthropic：tool_use / tool_result 历史转换成 Tool_calls + Tool_call_
     const json = await res.json();
     assert.equal(json.stop_reason, 'end_turn');
 
-    // 历史里的 tool_use 渲染成 ## Tool_calls 段里的 JSON 行（绝不写 DSML / DO）
-    assert.match(web.lastPrompt, /## Tool_calls:\n\{"name":"exec_shell","args":\{"command":"uname -r"\}\}/);
-    const history = web.lastPrompt.slice(web.lastPrompt.indexOf('## User:'));
+    // 历史里的 tool_use 用密文块重建（不是 JSON：JSON 是最明显的工具调用特征）
+    const expectedBlock =
+      `${PUA_C.TC_OPEN}${PUA_C.INVOKE}exec_shell` +
+      `${PUA_C.PARAM}command${PUA_C.VALUE}uname -r${PUA_C.PARAM_END}` +
+      `${PUA_C.END_INVOKE}${PUA_C.TC_CLOSE}`;
+    assert.ok(web.attachmentText.includes(expectedBlock), `调用没进上下文:\n${web.attachmentText}`);
+    assert.ok(!web.attachmentText.includes('"args"'), '历史里不能出现 JSON 调用记录');
+    const history = web.attachmentText.slice(web.attachmentText.indexOf(`${SECTION.user}\n`));
+    assert.ok(!history.includes('exec_shell({'), '历史里不该出现 PUA 块语法');
     assert.ok(!history.includes('DSML'), '历史里不该出现 DSML');
     assert.ok(!history.includes('DO:{'), '历史里不该出现 DO');
-    assert.match(web.lastPrompt, /## Tool_call_result:/);
-    assert.match(web.lastPrompt, /6\.1\.0/);
+    assert.ok(history.includes('6.1.0'), '工具结果要出现在历史里');
+    assert.ok(history.includes(`${TOOL_RECORD}:`), '结果要带零宽记录标记');
     // 工具结果不能混进 assistant 段
-    const assistantSection = web.lastPrompt.split('## Assistant:')[1]?.split('## Tool_calls:')[0] ?? '';
+    const assistantSection = web.attachmentText.split(`${SECTION.assistant}\n`)[1]?.split(`${SECTION.user}\n`)[0] ?? '';
     assert.ok(!/6\.1\.0/.test(assistantSection), '工具结果被写进了 assistant 段');
   });
 });
@@ -258,10 +279,9 @@ test('Anthropic 图片：base64 source 转成 image_url 并上传', async () => 
       }),
     );
     assert.equal(res.status, 200);
-    // 图片走 uploadImages，附件才走 uploadAttachments
+    // 图片走 uploadImages；正文走附件（PROMPT_AS_ATTACHMENT 默认开），两者都进 ref_file_ids
     assert.equal(web.uploadedImages, 1);
-    assert.equal(web.lastFileIds.length, 1);
-    assert.deepEqual(web.lastFileIds, ['img_0']);
+    assert.deepEqual(web.lastFileIds, ['img_0', 'file_0']);
   });
 });
 
@@ -305,7 +325,7 @@ test('Anthropic 流式：事件序列完整，文本增量正确', async () => {
 
 test('Anthropic 流式 tools：tool_use 块 + input_json_delta', async () => {
   const web = fakeWeb({
-    toolText: '<｜DSML｜ calls>\n<｜DSML｜ invoke name="exec_shell"><｜DSML｜ parameter name="command" string="true">ls</｜DSML｜ parameter></｜DSML｜ invoke>\n</｜DSML｜ calls>',
+    toolText: `${PUA_C.TC_OPEN}${PUA_C.INVOKE}exec_shell${PUA_C.PARAM}command${PUA_C.VALUE}ls${PUA_C.PARAM_END}${PUA_C.END_INVOKE}${PUA_C.TC_CLOSE}`,
   });
   await withServer({ web }, async (base) => {
     const res = await post(
@@ -463,15 +483,16 @@ test('Anthropic 超长上下文：较早内容拆成附件注入', async () => {
   }
   messages.push({ role: 'user', content: '最后的请求：用一句话总结' });
 
-  await withServer({ web }, async (base) => {
+  // 默认 MAX_PROMPT_CHARS 已提高到 165 万，这里显式压低预算来验证转附件逻辑
+  await withServer({ web, env: { MAX_PROMPT_CHARS: '100000' } }, async (base) => {
     const res = await post(base, '/v1/messages', simpleBody({ messages }));
     assert.equal(res.status, 200);
-    assert.equal(web.uploads.length, 1, '应该只上传一个附件');
+    assert.equal(web.uploads.length, 1, '整包只上传一个附件');
     assert.match(web.uploads[0], /^context-[0-9a-f]{8}\.txt$/);
     assert.deepEqual(web.lastFileIds, ['file_0']);
-    assert.ok(web.lastPrompt.length <= 100_000, `正文超限: ${web.lastPrompt.length}`);
-    assert.match(web.lastPrompt, /## CONTEXT_ATTACHMENT:/);
-    assert.match(web.lastPrompt, /最后的请求：用一句话总结/);
+    // 输入框只有引导（短），正文全在附件里
+    assert.ok(web.lastPrompt.length < 1000, `输入框应当很短: ${web.lastPrompt.length}`);
+    assert.match(web.attachmentText, /最后的请求：用一句话总结/);
   });
 });
 

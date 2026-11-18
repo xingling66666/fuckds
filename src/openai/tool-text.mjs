@@ -1,5 +1,5 @@
-import { findDsmlBlocks, findDsmlStart } from '../prompt/dsml.mjs';
-import { canonicalArguments, readJsonObject } from '../prompt/tools.mjs';
+import { findToolBlocksAny, findToolStartAny } from '../prompt/toolformat.mjs';
+import { readJsonObject } from '../prompt/tools.mjs';
 
 /**
  * 协议行识别。
@@ -25,9 +25,9 @@ const TOOL_RESULT_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?TOOL_RESULT_MESSAGES[ \t
 const TOOL_FUNCTIONS_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?TOOL_FUNCTIONS[ \t]*[:：]?[ \t]*$/gimu;
 const CONTEXT_HEADER = /^[ \t]{0,3}(?:#{1,4}[ \t]*)?CONTEXT_ATTACHMENT[ \t]*[:：]?[ \t]*$/gimu;
 const PROMPT_HEADER_LINE = /^[ \t]{0,3}#{1,4}[ \t]*MESSAGES[ \t]*[:：]?[ \t]*$/gimu;
-/** 新协议的段标题：## System: / ## User: / ## Tool_calls: / ## Tool_call_result: 之类 */
+/** 协议段标题（旧写法带冒号 / 旧名字也认）：## System / ## Tools / ## OTC / ## OTCR 之类 */
 const PROTOCOL_HEADER =
-  /^[ \t]{0,3}#{1,4}[ \t]*(?:System|User|Assistant|Tool_calls|Tool_call_result|Tool_functions|CONTEXT_ATTACHMENT|Messages)[ \t]*[:：]?[ \t]*$/gimu;
+  /^[ \t]{0,3}#{1,4}[ \t]*(?:System|User|Assistant|Tools|OTC|OTCR|FTC|FTCR|Tool_calls|Tool_call_result|Tool_functions|CONTEXT_ATTACHMENT|Messages)[ \t]*[:：]?[ \t]*$/gimu;
 const SECTION_PATTERNS = [
   SECTION_HEADER,
   TOOL_RESULT_HEADER,
@@ -125,22 +125,21 @@ export function findNativeToolTokenBlocks(text) {
  * 找出文本里的 DO:/RESULT: 块。
  * 这些是「给模型看的协议行」，不应该出现在 OpenAI 的 content 里。
  */
-export function findToolMarkup(text) {
+export function findToolMarkup(text, knownTools = null) {
   const blocks = [];
   if (!text) return blocks;
+
+  // 工具调用块：XML(<____tool____>) 与 DSML 都整块算协议（不能漏进 content）
+  for (const block of findToolBlocksAny(text)) {
+    if (covered(blocks, block.start)) continue;
+    blocks.push({ kind: 'TOOL_CALL', start: block.start, end: block.end });
+  }
 
   // <tool_call>{...}</tool_call>
   const xmlPattern = /<tool_call>[\s\S]*?<\/tool_call>/g;
   let xml;
   while ((xml = xmlPattern.exec(text)) !== null) {
     blocks.push({ kind: 'TOOL_CALL', start: xml.index, end: xml.index + xml[0].length });
-  }
-
-  // DSML：<｜DSML｜calls>…</｜DSML｜calls>（含未闭合的残段）
-  for (const block of findDsmlBlocks(text)) {
-    const overlapped = blocks.some((b) => b.start <= block.start && block.start < b.end);
-    if (overlapped) continue;
-    blocks.push({ kind: 'TOOL_CALL', start: block.start, end: block.end });
   }
 
   // 原生工具 token：<|tool▁calls▁begin|>…<|tool▁calls▁end|>（含中间夹的 JSON 参数体）。
@@ -262,9 +261,21 @@ export function findSectionBlocks(text) {
 }
 
 /** 去掉协议行，保留正常正文 */
-export function stripToolMarkup(text) {
+export function stripToolMarkup(text, knownTools = null) {
   if (!text) return '';
-  const blocks = findToolMarkup(text);
+  const blocks = findToolMarkup(text, knownTools);
+  // 裸代码块（语言标记 = 工具名）也要剔掉：nudge 模式下模型就这么输出
+  if (Array.isArray(knownTools) && knownTools.length) {
+    const allow = new Set(knownTools.map((n) => String(n).toLowerCase()));
+    const re = /```([A-Za-z0-9_+.-]+)[ \t]*\r?\n[\s\S]*?```/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const lang = String(m[1] || '').toLowerCase();
+      if (!allow.has(lang)) continue;
+      blocks.push({ start: m.index, end: m.index + m[0].length });
+    }
+    blocks.sort((a, b) => a.start - b.start);
+  }
   if (!blocks.length) return text;
 
   let out = '';
@@ -400,7 +411,7 @@ export function hasFabricatedProtocol(text) {
   return findToolMarkup(text).some((block) => isFabricatedBlock(block));
 }
 
-/** 找出文本里第一个「模型伪造协议」的块（RESULT / 伪造 ## 段标题）；正常 DO / DSML / 原生工具调用 / END 不算 */
+/** 找出文本里第一个「模型伪造协议」的块（RESULT / 伪造段标题）；正常工具调用 / END 标记不算 */
 export function findFabricatedBlock(text) {
   if (!text) return null;
   return findToolMarkup(text).find((block) => isFabricatedBlock(block)) || null;
@@ -521,11 +532,17 @@ function pendingProtocolStart(text, from) {
  * 还要用 pendingProtocolStart() 把「可能正在成形的协议」整段扣在手里。
  */
 export class ToolMarkupStreamFilter {
-  constructor({ holdBack = 48 } = {}) {
+  /**
+   * @param {object} [options]
+   * @param {number} [options.holdBack] 尾部至少保留多少字符，避免半截协议漏发
+   * @param {string[]|null} [options.knownTools] 声明过的工具名（诊断用，不参与过滤）
+   */
+  constructor({ holdBack = 48, knownTools = null } = {}) {
     this.buffer = '';
     this.emitted = 0;
     this.cutIndex = -1;
     this.holdBack = holdBack;
+    this.knownTools = knownTools;
     /** 触发截断的块类型：DO / TOOL_CALL / RESULT / SECTION */
     this.cutKind = null;
   }
@@ -536,15 +553,15 @@ export class ToolMarkupStreamFilter {
 
     let limit = this.cutIndex >= 0 ? this.cutIndex : Math.max(0, this.buffer.length - this.holdBack);
     if (this.cutIndex < 0) {
-      // 半截 DSML 标签也先扣在手里
-      const dsml = findDsmlStart(this.buffer, this.emitted);
-      if (dsml) limit = Math.min(limit, dsml.index);
       // 半截 DO:/RESULT:、半截段落标题、半截原生工具 token：同样不能先发出去
       const pending = pendingProtocolStart(this.buffer, this.emitted);
       if (pending >= 0) limit = Math.min(limit, pending);
       // 半截 <|END 也不能先发（完整 <|END|> 由 findToolMarkup 整块剔除）
       const pendingEnd = findPendingEndToken(this.buffer, this.emitted);
       if (pendingEnd >= 0) limit = Math.min(limit, pendingEnd);
+      // 半截 DSML 标签：等它长完再判，别先当正文发出去
+      const tool = findToolStartAny(this.buffer, this.emitted);
+      if (tool) limit = Math.min(limit, tool.index);
     }
     return this.#slice(limit);
   }
@@ -558,10 +575,10 @@ export class ToolMarkupStreamFilter {
     this.cutKind = cut.kind;
   }
 
-  /** 没有工具调用：把剩下的正文（含被挡住的部分，去掉协议行）补发出去 */
+  /** 收尾：把剩下的正文（含被挡住的部分，去掉协议块）补发出去 */
   flushRest() {
     const rest = this.cutIndex >= 0 ? this.buffer.slice(this.cutIndex) : this.buffer.slice(this.emitted);
-    const cleaned = this.cutIndex >= 0 ? stripToolMarkup(rest) : rest;
+    const cleaned = stripToolMarkup(rest, this.knownTools);
     this.emitted = this.buffer.length;
     return cleaned;
   }
@@ -589,13 +606,12 @@ export class ToolMarkupStreamFilter {
     if (this.buffer.length >= 4096 && this.emitted > 0) {
       searchFrom = this.buffer.lastIndexOf('\n', this.emitted - 1) + 1;
     }
-    const blocks = findToolMarkup(searchFrom ? this.buffer.slice(searchFrom) : this.buffer);
+    const blocks = findToolMarkup(searchFrom ? this.buffer.slice(searchFrom) : this.buffer, this.knownTools);
     if (blocks.length) {
       candidates.push({ index: searchFrom + blocks[0].start, kind: blocks[0].kind });
     }
-    const dsml = findDsmlStart(this.buffer, this.emitted);
-    // 只有标签已经完整时才永久截断；半截标签由 holdBack 兜住
-    if (dsml?.complete) candidates.push({ index: dsml.index, kind: 'TOOL_CALL' });
+    const toolStart = findToolStartAny(this.buffer, this.emitted);
+    if (toolStart?.complete) candidates.push({ index: toolStart.index, kind: 'TOOL_CALL' });
     const section = findSectionStart(this.buffer, this.emitted);
     if (section >= 0) candidates.push({ index: section, kind: 'SECTION' });
     if (!candidates.length) return null;

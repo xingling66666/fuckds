@@ -11,8 +11,10 @@ import path from 'node:path';
  * 每个账号有独立的：门禁（冷却）、PoW 预解、会话预建、设备 ID。
  */
 export class AccountPool {
-  constructor({ tokens, dataDir, logger }) {
+  constructor({ tokens, dataDir, logger, onAuthFailure = null }) {
     this.log = logger;
+    /** 账号被判「登录态失效」时回调（上层用来写库打标，避免下次再试） */
+    this.onAuthFailure = onAuthFailure;
     this.dataDir = dataDir;
     this.accounts = tokens.map((token, index) => ({
       index,
@@ -109,7 +111,15 @@ export class AccountPool {
     account.errorCount += 1;
     account.lastError = reason;
     account.lastFailureKind = kind;
-    if (authFailed) account.authFailed = true;
+    if (authFailed) {
+      account.authFailed = true;
+      // 持久化吊销标记：下次启动/重建号池时直接跳过，不用再撞一次
+      try {
+        this.onAuthFailure?.(account.token, reason);
+      } catch {
+        /* 打标失败不影响本次处理 */
+      }
+    }
     const seconds = Math.round(ms / 100) / 10;
     this.log.warn(
       `账号 #${account.index + 1} 不可用（${reason}），停用 ${seconds}s（池内还有 ${

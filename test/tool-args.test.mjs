@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { buildPrompt } from '../src/prompt/build.mjs';
-import { SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
+import { SPECIAL_TOKENS_HEADER_STEALTH, SPECIAL_TOKENS_HEADER } from '../src/prompt/special.mjs';
 import { coerceToolCallArguments, getToolSchemas, renderToolDeclarations } from '../src/prompt/tools.mjs';
 
 const TOOLS = [
@@ -28,18 +28,18 @@ const TOOLS = [
 
 const schemas = getToolSchemas(TOOLS);
 
-test('prompt is English and forbids omitting the string attribute', () => {
-  assert.ok(!/[\u4e00-\u9fff]/.test(SPECIAL_TOKENS_HEADER), 'system prompt must not contain Chinese');
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('NEVER omit'));
-  assert.ok(SPECIAL_TOKENS_HEADER.includes('string="false"'));
+test('协议提示词交代了输出格式，工具声明是签名式', () => {
+  const PROTOCOL = SPECIAL_TOKENS_HEADER_STEALTH;
+  assert.ok(/dsml/i.test(PROTOCOL) || /[\uE000-\uE009]/.test(PROTOCOL), '要教一种输出格式');
   const { prompt } = buildPrompt({
     messages: [{ role: 'user', content: 'hi' }],
     tools: TOOLS,
+    promptStyle: 'stealth',
   });
-  assert.ok(prompt.includes('NEVER omit'));
-  // required is surfaced at the top level of the declaration, not only nested
-  const decl = JSON.parse(renderToolDeclarations(TOOLS)[0]);
-  assert.deepEqual(decl.required, ['query']);
+  assert.ok(prompt.includes(PROTOCOL.trim()), '拼出来的 prompt 要带协议说明');
+  const decl = renderToolDeclarations(TOOLS).join('\n');
+  assert.match(decl, /search_files\(query: text/);
+  assert.ok(!decl.includes('{"name"'), '工具声明不该是 JSON');
 });
 
 test('coerce: stringified number/boolean/array/object are restored to their declared types', () => {

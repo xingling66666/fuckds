@@ -41,7 +41,8 @@ export function applyPatch(state, patch) {
     if (patch.v && typeof patch.v === 'object') {
       const response = patch.v.response;
       if (response) {
-        state.messageId = response.message_id ?? state.messageId;
+        const mid = response.message_id;
+        if (mid !== undefined && mid !== null && String(mid).trim()) state.messageId = String(mid);
         if (Array.isArray(response.fragments)) state.fragments = response.fragments;
         if (response.status) state.status = response.status;
       }
@@ -51,6 +52,9 @@ export function applyPatch(state, patch) {
   }
 
   const path = String(patch.p);
+  if (process.env.DUMP_STREAM_PATHS === '1' && /(message|id|parent)/i.test(path)) {
+    process.stderr.write(`[stream] ${path} = ${JSON.stringify(patch.v).slice(0, 60)}\n`);
+  }
   const op = patch.o || 'APPEND';
 
   if (op === 'BATCH') {
@@ -62,8 +66,40 @@ export function applyPatch(state, patch) {
     return;
   }
 
+  // message_id 可能在首帧之外单独下发（response/message_id 或 response.id）
+  if ((path === 'response/message_id' || path === 'response/id') && typeof patch.v === 'string') {
+    // DeepSeek 的 parent_message_id 就是 "2" 这种短数字（会话内序号），别按"像不像 uuid"筛
+    if (/^[A-Za-z0-9_-]+$/.test(patch.v)) state.messageId = patch.v;
+    return;
+  }
+
   if (path === 'response/fragments' && op === 'APPEND') {
-    if (Array.isArray(patch.v)) state.fragments.push(...patch.v);
+    if (!Array.isArray(patch.v)) return;
+    /**
+     * 片段去重。
+     *
+     * 服务端偶尔会把同一批 fragments 再 APPEND 一次（重连 / 心跳后的补发），
+     * 以前直接 push，于是同一段思考在 fragments 里出现两份，前端看到的就是
+     * 整段思考吐两遍（实测："The user asks … Answer simply in Chinese." 连着两份，
+     * 中间连换行都没有）。
+     *
+     * 去重键按优先级：片段 id → (type, content) 完全相同。
+     * 注意只对"整段新增片段"去重；`fragments/-1/content` 的增量追加不受影响
+     * （那里是正常流式增长）。
+     */
+    const keyOf = (f) => f?.id ?? f?.fragment_id ?? f?.fragmentId ?? null;
+    for (const fragment of patch.v) {
+      const key = keyOf(fragment);
+      if (key != null) {
+        if (state.fragments.some((existing) => keyOf(existing) === key)) continue;
+      } else if (
+        fragment?.content &&
+        state.fragments.some((existing) => existing?.type === fragment?.type && existing?.content === fragment.content)
+      ) {
+        continue;
+      }
+      state.fragments.push(fragment);
+    }
     return;
   }
 

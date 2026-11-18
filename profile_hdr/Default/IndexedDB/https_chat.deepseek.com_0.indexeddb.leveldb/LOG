@@ -1,0 +1,13 @@
+2026/11/16-21:01:41.615 3b0f Reusing MANIFEST /root/opends-freetoken/profile_hdr/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/16-21:01:41.615 3b0f Recovering log #21
+2026/11/16-21:01:41.616 3b0f Reusing old log /root/opends-freetoken/profile_hdr/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000021.log 
+2026/11/16-21:01:41.673 3b10 Level-0 table #25: started
+2026/11/16-21:01:41.675 3b10 Level-0 table #25: 1436 bytes OK
+2026/11/16-21:01:41.678 3b10 Delete type=0 #21
+2026/11/16-21:01:41.678 3b10 Manual compaction at level-0 from '\x00\x07\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x08\x00\x00\x00' @ 0 : 0; will stop at '\x00\x07\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 555 : 1
+2026/11/16-21:01:41.678 3b10 Compacting 1@0 + 1@1 files
+2026/11/16-21:01:41.683 3b10 Generated table #26@0: 28 keys, 469 bytes
+2026/11/16-21:01:41.683 3b10 Compacted 1@0 + 1@1 files => 469 bytes
+2026/11/16-21:01:41.690 3b10 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-21:01:41.690 3b10 Delete type=2 #25
+2026/11/16-21:01:41.692 3b10 Manual compaction at level-0 from '\x00\x07\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 555 : 1 .. '\x00\x08\x00\x00\x00' @ 0 : 0; will stop at (end)

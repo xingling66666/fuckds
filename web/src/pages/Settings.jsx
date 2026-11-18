@@ -59,10 +59,14 @@ export default function Settings() {
       const payload = {};
       for (const key of changedKeys) payload[key] = values[key];
       const result = await adminApi('/config', { method: 'PUT', body: { values: payload } });
-      toast(`已写入 ${result.saved.length} 项配置`);
+      toast(result.message ?? `已保存 ${result.saved.length} 项配置`);
       await load();
       if (result.restartRequired) {
-        const ok = await askConfirm(result.message, '需要重启生效', '立即重启');
+        const ok = await askConfirm(
+          `${result.message}\n\n现在重启服务吗？（会断开正在进行的对话）`,
+          '部分配置需要重启',
+          '立即重启',
+        );
         if (ok) await restart();
       }
     } catch (err) {
@@ -124,7 +128,10 @@ export default function Settings() {
       <div className="page-head">
         <div>
           <h1>设置</h1>
-          <p className="muted">改完会写回项目根目录的 .env，重启服务后生效。没写进 .env 的项用默认值，这里显示的是当前生效值。</p>
+          <p className="muted">
+            配置保存在 SQLite（data/config.db），保存后即时生效、无需重启；只有 HOST / PORT / CONCURRENCY / QUEUE_LIMIT / WARMUP
+            这些启动时决定的项需要重启。
+          </p>
         </div>
         <div className="page-actions">
           <Btn variant="tonal" icon="refresh" onClick={load}>
@@ -136,13 +143,19 @@ export default function Settings() {
         </div>
       </div>
 
+      {config.note ? (
+        <Banner tone="info" icon="bolt">
+          {config.note}
+        </Banner>
+      ) : null}
+
       {changedKeys.length ? (
         <Banner tone="warn" icon="edit_note">
           有 {changedKeys.length} 项改动还没保存：{changedKeys.join(' / ')}
         </Banner>
       ) : null}
 
-      <Card title="配置项" subtitle={config.envFile}>
+      <Card title="配置项" subtitle={config.dbFile ?? config.envFile}>
         <div className="form-grid">
           {config.schema.map((item) => (
             <div className="field" key={item.key}>
@@ -162,7 +175,8 @@ export default function Settings() {
             重启服务
           </Btn>
           <span className="field-note">
-            重启会断开正在进行的对话；如果服务被 pm2 托管，请直接 pm2 restart。
+            日常改配置不需要重启（保存即生效）；只有 HOST / PORT / CONCURRENCY / QUEUE_LIMIT / WARMUP
+            需要重启。重启会断开正在进行的对话；如果服务被 pm2 托管，请直接 pm2 restart。
           </span>
         </div>
       </Card>

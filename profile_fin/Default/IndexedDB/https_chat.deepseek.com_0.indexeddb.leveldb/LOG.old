@@ -1,0 +1,25 @@
+2026/11/16-20:35:33.966 2d39 Reusing MANIFEST /root/opends-freetoken/profile_fin/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/16-20:35:33.967 2d39 Recovering log #47
+2026/11/16-20:35:33.967 2d39 Reusing old log /root/opends-freetoken/profile_fin/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000047.log 
+2026/11/16-20:35:33.967 2d39 Delete type=2 #46
+2026/11/16-20:35:34.217 2d33 Level-0 table #52: started
+2026/11/16-20:35:34.223 2d33 Level-0 table #52: 1057 bytes OK
+2026/11/16-20:35:34.226 2d33 Delete type=0 #47
+2026/11/16-20:35:34.227 2d33 Manual compaction at level-0 from '\x00\x10\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x11\x00\x00\x00' @ 0 : 0; will stop at '\x00\x10\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 1188 : 1
+2026/11/16-20:35:34.227 2d33 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:34.234 2d33 Generated table #53@0: 27 keys, 460 bytes
+2026/11/16-20:35:34.234 2d33 Compacted 1@0 + 1@1 files => 460 bytes
+2026/11/16-20:35:34.241 2d33 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:34.241 2d33 Delete type=2 #52
+2026/11/16-20:35:34.242 2d33 Manual compaction at level-0 from '\x00\x10\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 1188 : 1 .. '\x00\x11\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-20:35:35.180 2d3d Level-0 table #55: started
+2026/11/16-20:35:35.184 2d3d Level-0 table #55: 1412 bytes OK
+2026/11/16-20:35:35.190 2d3d Delete type=2 #49
+2026/11/16-20:35:35.190 2d3d Delete type=0 #51
+2026/11/16-20:35:35.190 2d33 Manual compaction at level-0 from '\x00\x11\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x12\x00\x00\x00' @ 0 : 0; will stop at '\x00\x11\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1273 : 1
+2026/11/16-20:35:35.190 2d33 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:35.194 2d33 Generated table #56@0: 27 keys, 466 bytes
+2026/11/16-20:35:35.194 2d33 Compacted 1@0 + 1@1 files => 466 bytes
+2026/11/16-20:35:35.197 2d33 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:35.199 2d33 Delete type=2 #55
+2026/11/16-20:35:35.200 2d3f Manual compaction at level-0 from '\x00\x11\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1273 : 1 .. '\x00\x12\x00\x00\x00' @ 0 : 0; will stop at (end)

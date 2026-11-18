@@ -8,3 +8,6 @@ data/
 test/.artifacts/
 bin/
 .DS_Store
+
+# 构建产物：内联的后台静态资源（由 scripts/embed-web.mjs 生成）
+src/admin/web-assets.generated.mjs

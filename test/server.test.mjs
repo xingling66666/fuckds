@@ -2,8 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { createServer } from '../src/server.mjs';
+import { ATTACHMENT_HINT } from '../src/prompt/special.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { makeConfig } from './helpers/browser.mjs';
+import { makeConfig } from './helpers/config.mjs';
 
 const logger = createLogger('error');
 
@@ -24,16 +25,24 @@ function fakeWeb({
     uploads: [],
     lastPrompt: '',
     lastFileIds: [],
+    attachmentText: '',
     status: () => ({ browser: true, token: true }),
+    async uploadImages(images = []) {
+      web.uploadedImages = (web.uploadedImages ?? 0) + images.length;
+      return images.map((_, i) => `img_${web.uploadedImages - images.length + i}`);
+    },
     async uploadAttachments(files = []) {
       const base = web.uploads.length;
       web.uploads.push(...files.map((f) => f.name));
+      // 记下附件正文：现在整条 prompt 都在附件里，断言要看这个
+      web.attachmentText = files.map((f) => (f.buffer ? f.buffer.toString('utf8') : '')).join('\n');
       return files.map((_, i) => `file_${base + i}`);
     },
-    async chat({ prompt, refFileIds = [], onDelta, onThinking }) {
+    async chat({ prompt, thinking: thinkingFlag, refFileIds = [], onDelta, onThinking }) {
       web.calls += 1;
       web.lastPrompt = prompt;
       web.lastFileIds = refFileIds;
+      web.lastThinking = thinkingFlag;
       if (failWith) throw failWith;
       if (failOnCall !== null && web.calls === failOnCall) throw new Error('fake upstream failure');
       const reason = thinking;
@@ -149,6 +158,183 @@ test('tools：DO 文本转成 tool_calls，finish_reason=tool_calls', async () =
     assert.equal(calls[0].function.name, 'exec_shell');
     assert.deepEqual(JSON.parse(calls[0].function.arguments), { command: 'uname -a' });
     assert.equal(json.choices[0].finish_reason, 'tool_calls');
+  });
+});
+
+test('tools：OTML 文本转成 tool_calls，content 里不残留调用文本', async () => {
+  const toolText = '我来看看\n```otml\nexec_shell({command:"uname -a", timeout:10});\n```';
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell', description: 'Exec shell command' } }] }),
+      ),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.tool_calls.length, 1);
+    assert.equal(message.tool_calls[0].function.name, 'exec_shell');
+    assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { command: 'uname -a', timeout: 10 });
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    assert.ok(!message.content.includes('exec_shell'), `content 不该包含 OTML 调用: ${message.content}`);
+    assert.match(message.content, /我来看看/);
+  });
+});
+
+// 当前对外协议：PUA-TCL（Unicode 私有区控制字符定界，见 OTML.md）
+const puaChar = (code) => String.fromCharCode(code);
+const puaCall = (name, params) =>
+  `${puaChar(0xe000)}${puaChar(0xe002)}${name}${params}${puaChar(0xe003)}${puaChar(0xe001)}`;
+const PUA_CMD_PARAMS =
+  `${puaChar(0xe004)}command${puaChar(0xe008)}${puaChar(0xe005)}uname -a${puaChar(0xe006)}` +
+  `${puaChar(0xe004)}timeout${puaChar(0xe009)}${puaChar(0xe005)}10${puaChar(0xe006)}`;
+
+test('tools：PUA-TCL 块转成 tool_calls，content 里不残留控制字符与调用文本', async () => {
+  const toolText = `我来看看\n${puaCall('exec_shell', PUA_CMD_PARAMS)}`;
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell', description: 'Exec shell command' } }] }),
+      ),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.tool_calls.length, 1);
+    assert.equal(message.tool_calls[0].function.name, 'exec_shell');
+    // U+E009 类型标记 → number，不能被当成字符串 "10"
+    assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { command: 'uname -a', timeout: 10 });
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    assert.ok(!/[\uE000-\uE009]/.test(message.content), `content 不该含 PUA 控制字符: ${JSON.stringify(message.content)}`);
+    assert.ok(!message.content.includes('exec_shell'), `content 不该包含调用文本: ${message.content}`);
+    assert.match(message.content, /我来看看/);
+  });
+});
+
+test('流式：PUA-TCL 调用不会漏进 content 增量', async () => {
+  const toolText = `我来试试：\n\n${puaCall('exec_shell', PUA_CMD_PARAMS)}\n\n然后再说一句。`;
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody({ stream: true, tools: [{ type: 'function', function: { name: 'exec_shell' } }] })),
+    });
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((b) => b.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((l) => l !== '[DONE]')
+      .map((l) => JSON.parse(l));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    assert.ok(!/[\uE000-\uE009]/.test(content), '流式 content 不该含 PUA 控制字符');
+    assert.ok(!content.includes('exec_shell'), `流式 content 不该包含调用文本: ${content}`);
+    assert.match(content, /我来试试/);
+    assert.match(content, /然后再说一句/);
+  });
+});
+
+test('流式：OTML 调用不会漏进 content 增量', async () => {
+  const toolText = '我来试试：\n\n```otml\nexec_shell({command:"ls"})\n```\n\n然后再说一句。';
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ stream: true, tools: [{ type: 'function', function: { name: 'exec_shell' } }] }),
+      ),
+    });
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((b) => b.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((l) => l !== '[DONE]')
+      .map((l) => JSON.parse(l));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    assert.ok(!content.includes('exec_shell'), `流式 content 不该包含 OTML 调用: ${content}`);
+    assert.ok(!content.includes('{command'), `流式 content 不该包含调用参数: ${content}`);
+    assert.match(content, /我来试试/);
+    assert.match(content, /然后再说一句/);
+    const calls = chunks.flatMap((c) => c.choices[0]?.delta?.tool_calls ?? []);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('<think> 映射到 reasoning_content，且不进入 content', async () => {
+  const web = fakeWeb({ answer: '<think>先拆解一下问题，再回答。</think>你好！', thinking: '' });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody()),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.content, '你好！');
+    assert.equal(message.reasoning_content, '先拆解一下问题，再回答。');
+    assert.equal(web.lastThinking, true, '原生深度思考默认开启（DEEPSEEK_THINKING=always）');
+  });
+});
+
+test('流式：<think> 走 reasoning_content，content 里不出现标签', async () => {
+  const web = fakeWeb({ answer: '前文<think>推理过程</think>后文', thinking: '' });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody({ stream: true })),
+    });
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((block) => block.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((line) => line !== '[DONE]')
+      .map((line) => JSON.parse(line));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    const reasoning = chunks.map((c) => c.choices[0]?.delta?.reasoning_content ?? '').join('');
+    assert.equal(content, '前文后文');
+    assert.equal(reasoning, '推理过程');
+    assert.ok(!content.includes('<think') && !content.includes('</think'));
+    assert.equal(web.lastThinking, true, '原生深度思考默认开启（DEEPSEEK_THINKING=always）');
+  });
+});
+
+test('OTML 块外的普通 JS 代码不会被当成工具调用或删掉', async () => {
+  const toolText = [
+    '示例代码：',
+    'const r = app.get({path:"/"});',
+    '```otml',
+    'exec_shell({command:"ls"});',
+    '```',
+    '以上。',
+  ].join('\n');
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell' } }] }),
+      ),
+    });
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.tool_calls.length, 1);
+    assert.equal(message.tool_calls[0].function.name, 'exec_shell');
+    assert.match(message.content, /app\.get\(\{path:"\/"\}\);/);
+    assert.match(message.content, /示例代码/);
+    assert.match(message.content, /以上/);
+    assert.ok(!message.content.includes('```otml'));
+    assert.ok(!message.content.includes('exec_shell'));
   });
 });
 
@@ -307,35 +493,33 @@ test('/healthz 反映浏览器状态', async () => {
   });
 });
 
-const DSML_TOOL_TEXT = `我来看看
-<｜DSML｜calls>
-<｜DSML｜invoke name="exec_shell">
-<｜DSML｜parameter name="command" string="true">uname -a</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜calls>`;
-
-test('tools：DSML 文本转成 tool_calls，content 里没有 DSML', async () => {
-  await withServer({ web: fakeWeb({ toolText: DSML_TOOL_TEXT }) }, async (base) => {
+test('流式：PUA-TCL 调用不会漏进 content 增量', async () => {
+  const toolText = `我来试试：\n\n${puaCall('exec_shell', PUA_CMD_PARAMS)}\n\n然后再说一句。`;
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
     const res = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(
-        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell', description: 'Exec shell command' } }] }),
-      ),
+      body: JSON.stringify(chatBody({ stream: true, tools: [{ type: 'function', function: { name: 'exec_shell' } }] })),
     });
-    const json = await res.json();
-    const message = json.choices[0].message;
-    assert.equal(message.tool_calls.length, 1);
-    assert.equal(message.tool_calls[0].function.name, 'exec_shell');
-    assert.deepEqual(JSON.parse(message.tool_calls[0].function.arguments), { command: 'uname -a' });
-    assert.ok(!message.content.includes('DSML'), `content 不该包含 DSML: ${message.content}`);
-    assert.match(message.content, /我来看看/);
-    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((b) => b.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((l) => l !== '[DONE]')
+      .map((l) => JSON.parse(l));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    assert.ok(!/[\uE000-\uE009]/.test(content), '流式 content 不该含 PUA 控制字符');
+    assert.ok(!content.includes('exec_shell'), `流式 content 不该包含调用文本: ${content}`);
+    assert.match(content, /我来试试/);
+    assert.match(content, /然后再说一句/);
   });
 });
 
-test('流式：DSML 标签不会出现在 content 增量里', async () => {
-  await withServer({ web: fakeWeb({ toolText: DSML_TOOL_TEXT }) }, async (base) => {
+test('流式：OTML 调用不会漏进 content 增量', async () => {
+  const toolText = '我来试试：\n\n```otml\nexec_shell({command:"ls"})\n```\n\n然后再说一句。';
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
     const res = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -352,12 +536,238 @@ test('流式：DSML 标签不会出现在 content 增量里', async () => {
       .map((l) => JSON.parse(l));
 
     const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
-    assert.ok(!content.includes('DSML'), `流式 content 不该包含 DSML: ${content}`);
-    assert.match(content, /我来看看/);
-
+    assert.ok(!content.includes('exec_shell'), `流式 content 不该包含 OTML 调用: ${content}`);
+    assert.ok(!content.includes('{command'), `流式 content 不该包含调用参数: ${content}`);
+    assert.match(content, /我来试试/);
+    assert.match(content, /然后再说一句/);
     const calls = chunks.flatMap((c) => c.choices[0]?.delta?.tool_calls ?? []);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].function.name, 'exec_shell');
+  });
+});
+
+test('<think> 映射到 reasoning_content，且不进入 content', async () => {
+  const web = fakeWeb({ answer: '<think>先拆解一下问题，再回答。</think>你好！', thinking: '' });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody()),
+    });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.content, '你好！');
+    assert.equal(message.reasoning_content, '先拆解一下问题，再回答。');
+    assert.equal(web.lastThinking, true, '原生深度思考默认开启（DEEPSEEK_THINKING=always）');
+  });
+});
+
+test('流式：<think> 走 reasoning_content，content 里不出现标签', async () => {
+  const web = fakeWeb({ answer: '前文<think>推理过程</think>后文', thinking: '' });
+  await withServer({ web }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody({ stream: true })),
+    });
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((block) => block.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((line) => line !== '[DONE]')
+      .map((line) => JSON.parse(line));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    const reasoning = chunks.map((c) => c.choices[0]?.delta?.reasoning_content ?? '').join('');
+    assert.equal(content, '前文后文');
+    assert.equal(reasoning, '推理过程');
+    assert.ok(!content.includes('<think') && !content.includes('</think'));
+    assert.equal(web.lastThinking, true, '原生深度思考默认开启（DEEPSEEK_THINKING=always）');
+  });
+});
+
+test('OTML 块外的普通 JS 代码不会被当成工具调用或删掉', async () => {
+  const toolText = [
+    '示例代码：',
+    'const r = app.get({path:"/"});',
+    '```otml',
+    'exec_shell({command:"ls"});',
+    '```',
+    '以上。',
+  ].join('\n');
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell' } }] }),
+      ),
+    });
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.tool_calls.length, 1);
+    assert.equal(message.tool_calls[0].function.name, 'exec_shell');
+    assert.match(message.content, /app\.get\(\{path:"\/"\}\);/);
+    assert.match(message.content, /示例代码/);
+    assert.match(message.content, /以上/);
+    assert.ok(!message.content.includes('```otml'));
+    assert.ok(!message.content.includes('exec_shell'));
+  });
+});
+
+test('工具调用：content 里不出现 DO/RESULT 协议行', async () => {
+  const toolText = '我来试试：\n\nDO:{"name":"exec_shell","args":{"command":"uname -a"}}\n\n稍等。';
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ tools: [{ type: 'function', function: { name: 'exec_shell' } }] }),
+      ),
+    });
+    const json = await res.json();
+    const message = json.choices[0].message;
+    assert.equal(message.tool_calls.length, 1);
+    assert.ok(!message.content.includes('DO:'), `content 不该包含协议行: ${message.content}`);
+    assert.match(message.content, /我来试试/);
+  });
+});
+
+test('工具调用：重复的调用照样返回，伪造成果（RESULT）仍从正文里剔除', async () => {
+  const echo = '可以，我写个示例：\n\nDO:{"name":"eval_javascript","args":{"code":"1+1"}}\nRESULT:{"result":"2"}\n\n执行成功，结果是 2。';
+  await withServer({ web: fakeWeb({ toolText: echo }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-flash',
+        messages: [
+          { role: 'user', content: '跑一下 1+1' },
+          {
+            role: 'assistant',
+            content: '好的',
+            tool_calls: [
+              { id: 'call_1', type: 'function', function: { name: 'eval_javascript', arguments: '{"code":"1+1"}' } },
+            ],
+          },
+          { role: 'tool', tool_call_id: 'call_1', name: 'eval_javascript', content: '{"result":"2"}' },
+        ],
+        tools: [{ type: 'function', function: { name: 'eval_javascript' } }],
+      }),
+    });
+    const json = await res.json();
+    const message = json.choices[0].message;
+    // 不再按「同名同参数」去重：agent 每步重发同一个调用是正常操作，丢掉等于把整轮吞成空回答
+    assert.equal(message.tool_calls?.length, 1, '重复的调用也要照实返回');
+    assert.equal(message.tool_calls[0].function.name, 'eval_javascript');
+    assert.equal(json.choices[0].finish_reason, 'tool_calls');
+    assert.ok(!message.content.includes('DO:'));
+    assert.ok(!message.content.includes('RESULT:'));
+    // 不截断：RESULT 之后的正文照常返回
+    assert.match(message.content, /可以，我写个示例/);
+    assert.match(message.content, /执行成功，结果是 2/);
+  });
+});
+
+test('流式：协议行不会出现在 content 增量里', async () => {
+  const toolText = '我来试试：\n\nDO:{"name":"exec_shell","args":{"command":"ls"}}\n\n然后再说一句。';
+  await withServer({ web: fakeWeb({ toolText }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(
+        chatBody({ stream: true, tools: [{ type: 'function', function: { name: 'exec_shell' } }] }),
+      ),
+    });
+    const text = await res.text();
+    const chunks = text
+      .split('\n\n')
+      .map((b) => b.replace(/^data: /, '').trim())
+      .filter(Boolean)
+      .filter((l) => l !== '[DONE]')
+      .map((l) => JSON.parse(l));
+
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? '').join('');
+    assert.ok(!content.includes('DO:'), `流式 content 不该包含协议行: ${content}`);
+    assert.ok(!content.includes('RESULT:'));
+    const calls = chunks.flatMap((c) => c.choices[0]?.delta?.tool_calls ?? []);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('参数校验：空 messages / 坏角色 / 坏 JSON', async () => {
+  await withServer({}, async (base) => {
+    const cases = [
+      [{ model: 'x' }, /messages/],
+      [{ messages: [{ role: 'robot', content: 'hi' }] }, /role/],
+      [{ messages: [{ role: 'user', content: [{ type: 'video_url', video_url: 'x' }] }] }, /不支持/],
+    ];
+    for (const [body, pattern] of cases) {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 400);
+      const json = await res.json();
+      assert.match(json.error.message, pattern);
+    }
+
+    const badJson = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{oops',
+    });
+    assert.equal(badJson.status, 400);
+  });
+});
+
+test('API_KEY 生效', async () => {
+  await withServer({ apiKey: 'secret-key' }, async (base) => {
+    const noAuth = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody()),
+    });
+    assert.equal(noAuth.status, 401);
+
+    const ok = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer secret-key' },
+      body: JSON.stringify(chatBody()),
+    });
+    assert.equal(ok.status, 200);
+  });
+});
+
+test('上游失败时返回 OpenAI 风格错误', async () => {
+  const { AuthExpiredError } = await import('../src/errors.mjs');
+  await withServer({ web: fakeWeb({ failWith: new AuthExpiredError() }) }, async (base) => {
+    const res = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(chatBody()),
+    });
+    assert.equal(res.status, 503);
+    const json = await res.json();
+    assert.equal(json.error.code, 'deepseek_auth_required');
+  });
+});
+
+test('未知路径 404', async () => {
+  await withServer({}, async (base) => {
+    const res = await fetch(`${base}/v1/nope`);
+    assert.equal(res.status, 404);
+  });
+});
+
+test('/healthz 反映浏览器状态', async () => {
+  await withServer({}, async (base) => {
+    const res = await fetch(`${base}/healthz`);
+    const json = await res.json();
+    assert.equal(json.ok, true);
+    assert.equal(json.browser, true);
   });
 });
 
@@ -366,11 +776,9 @@ test('多轮工具循环：模型原样重复上一个调用（每步都 observe
   // 旧实现按「同名同参数」把它当复述丢掉 → content 与 tool_calls 双双为空 → 客户端
   // 报「模型未返回正文或工具调用」把整轮 loop 判失败。
   const REPEAT_TEXT =
-    '<｜DSML｜ calls>\n' +
-    '<｜DSML｜ invoke name="observe_screen">\n' +
-    '<｜DSML｜ parameter name="include_screenshot" string="false">true</｜DSML｜ parameter>\n' +
-    '</｜DSML｜ invoke>\n' +
-    '</｜DSML｜ calls>';
+    `${puaChar(0xe000)}${puaChar(0xe002)}observe_screen` +
+    `${puaChar(0xe004)}include_screenshot${puaChar(0xe009)}${puaChar(0xe005)}true${puaChar(0xe006)}` +
+    `${puaChar(0xe003)}${puaChar(0xe001)}`;
   const messages = [
     { role: 'user', content: '看一眼屏幕' },
     {
@@ -586,7 +994,10 @@ test('非流式：伪造 ## 段落标题只从正文剔除，不再中止生成'
 test('非流式：工具调用只写在思考里时，提升成正式 tool_calls', async () => {
   const web = fakeWeb({
     answer: '',
-    thinking: '<|DSML|tool_calls>\n<|DSML|invoke name="exec_shell">\n<|DSML|parameter name="command">uname -a</|DSML|parameter>\n</|DSML|invoke>\n</|DSML|tool_calls>',
+    thinking:
+      `${puaChar(0xe000)}${puaChar(0xe002)}exec_shell` +
+      `${puaChar(0xe004)}command${puaChar(0xe005)}uname -a${puaChar(0xe006)}` +
+      `${puaChar(0xe003)}${puaChar(0xe001)}`,
   });
   await withServer({ web }, async (base) => {
     const res = await fetch(`${base}/v1/chat/completions`, {
@@ -618,39 +1029,22 @@ function longHistory(turns = 30, size = 3000) {
   return messages;
 }
 
-test('超长上下文：较早内容拆成附件，通过 ref_file_ids 注入', async () => {
+test('关掉正文转附件 + 关掉超长拆分：内容回到输入框', async () => {
   const web = fakeWeb();
-  await withServer({ web }, async (base) => {
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-flash', messages: longHistory() }),
-    });
-    assert.equal(res.status, 200);
-    assert.equal(web.uploads.length, 1, '应该只上传一个附件');
-    assert.match(web.uploads[0], /^context-[0-9a-f]{8}\.txt$/);
-
-    assert.deepEqual(web.lastFileIds, ['file_0']);
-    assert.ok(web.lastPrompt.length <= 100_000, `正文超限: ${web.lastPrompt.length}`);
-    assert.match(web.lastPrompt, /## CONTEXT_ATTACHMENT:/);
-    assert.match(web.lastPrompt, /最后的请求：用一句话总结/);
-    assert.ok(!web.lastPrompt.includes('第0步：'), '最早的内容不该留在正文');
-  });
-});
-
-test('超长上下文：关掉 OVERFLOW_TO_ATTACHMENT 就不拆', async () => {
-  const web = fakeWeb();
-  await withServer({ web, env: { OVERFLOW_TO_ATTACHMENT: 'false' } }, async (base) => {
-    const res = await fetch(`${base}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'deepseek-flash', messages: longHistory() }),
-    });
-    assert.equal(res.status, 200);
-    assert.equal(web.uploads.length, 0);
-    assert.ok(web.lastPrompt.length > 100_000);
-    assert.match(web.lastPrompt, /第0步：/);
-  });
+  await withServer(
+    { web, env: { PROMPT_AS_ATTACHMENT: 'false', OVERFLOW_TO_ATTACHMENT: 'false' } },
+    async (base) => {
+      const res = await fetch(`${base}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'deepseek-flash', messages: longHistory() }),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(web.uploads.length, 0);
+      assert.ok(web.lastPrompt.length > 100_000);
+      assert.match(web.lastPrompt, /第0步：/);
+    },
+  );
 });
 
 // ---------------------------------------------------------------- 原生工具 token 兜底

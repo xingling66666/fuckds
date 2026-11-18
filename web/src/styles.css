@@ -681,3 +681,195 @@ mdui-select {
     padding: 18px 14px 64px;
   }
 }
+
+/* ---------------- 蓝色主题覆盖 ---------------- */
+/* mdui 的 setColorScheme 已经在 main.jsx 里设成蓝色，
+   这里再兜一层：即便主题被切换，强调色也保持蓝色系。 */
+:root {
+  --admin-blue: 31 111 242;
+  --admin-blue-strong: 19 86 204;
+}
+
+mdui-top-app-bar {
+  border-bottom: 1px solid rgb(var(--mdui-color-outline-variant) / 0.6);
+}
+
+.nav-item[active],
+.nav-item[data-active='true'] {
+  background: rgb(var(--admin-blue) / 0.12);
+  color: rgb(var(--admin-blue));
+}
+
+a {
+  color: rgb(var(--admin-blue));
+}
+
+/* ---------------- 通用工具类（注册页等复用） ---------------- */
+.row.wrap {
+  flex-wrap: wrap;
+}
+
+.row.gap > * {
+  margin-inline-end: 4px;
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 14px;
+}
+
+/* ---------------- 注册页 ---------------- */
+.register-log {
+  margin-top: 14px;
+  max-height: 260px;
+  overflow-y: auto;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: rgb(var(--mdui-color-surface-container-high) / 0.65);
+  border: 1px solid rgb(var(--mdui-color-outline-variant) / 0.5);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.register-log-line {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.register-log-line > span:last-child {
+  word-break: break-all;
+}
+
+.table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.table-row {
+  display: grid;
+  grid-template-columns: 92px minmax(180px, 1.4fr) minmax(120px, 1fr) minmax(110px, 0.8fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.table-row:nth-child(odd) {
+  background: rgb(var(--mdui-color-surface-container-high) / 0.45);
+}
+
+.table-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgb(var(--mdui-color-on-surface-variant));
+  background: transparent !important;
+}
+
+/* ---------------- 免责声明 ---------------- */
+.disclaimer-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: radial-gradient(1200px 600px at 50% -10%, rgb(var(--admin-blue) / 0.18), transparent),
+    rgb(var(--mdui-color-surface) / 0.96);
+  backdrop-filter: blur(6px);
+}
+
+.disclaimer-card {
+  width: min(720px, 100%);
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 26px 28px;
+  border-radius: 20px;
+  background: rgb(var(--mdui-color-surface-container));
+  border: 1px solid rgb(var(--mdui-color-outline-variant) / 0.7);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 0.28);
+}
+
+.disclaimer-card h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: rgb(var(--admin-blue));
+}
+
+.disclaimer-body {
+  overflow-y: auto;
+  font-size: 13.5px;
+  line-height: 1.85;
+  padding-right: 6px;
+}
+
+.disclaimer-body p {
+  margin: 0 0 10px;
+}
+
+.disclaimer-body ol {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.disclaimer-body li {
+  margin-bottom: 6px;
+}
+
+.disclaimer-check {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  font-size: 13.5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.disclaimer-check input {
+  width: 16px;
+  height: 16px;
+}
+
+.disclaimer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid rgb(var(--mdui-color-outline-variant) / 0.6);
+  padding-top: 14px;
+}
+
+.disclaimer-btn {
+  padding: 10px 18px;
+  border-radius: 999px;
+  border: none;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  background: rgb(var(--admin-blue));
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+
+.disclaimer-btn:disabled {
+  cursor: not-allowed;
+  background: rgb(var(--mdui-color-outline-variant));
+  color: rgb(var(--mdui-color-on-surface-variant));
+}
+
+.disclaimer-btn:not(:disabled):hover {
+  filter: brightness(1.06);
+}

@@ -109,9 +109,11 @@ export function collectImages(messages = []) {
 }
 
 function resolveThinking(body, model, config) {
-  if (body.thinking !== undefined) return Boolean(body.thinking);
+  // DEEPSEEK_THINKING 是强制开关：always / never 优先于客户端显式传的 thinking，
+  // 否则客户端偶尔带一次 thinking:false，这一轮就会「没有思考」。
   if (config.deepseek.thinking === 'always') return true;
   if (config.deepseek.thinking === 'never') return false;
+  if (body.thinking !== undefined) return Boolean(body.thinking);
 
   const alias = config.deepseek.modelAliases[model];
   if (alias && alias.thinking !== undefined) return alias.thinking;

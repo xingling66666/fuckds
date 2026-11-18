@@ -344,7 +344,8 @@ export function installPageHelpers() {
   }
 
   function looksLikeStop(label) {
-    return /停止生成|停止|stop generating|^stop$/i.test(String(label || '').trim());
+    // 中英双语：中文 UI「停止生成/停止」，英文 UI「Stop generating / Stop」
+    return /停止生成|停止|stop generating|stop responding|^stop$|^pause$/i.test(String(label || '').trim());
   }
 
   function detectGenerating() {
@@ -368,9 +369,13 @@ export function installPageHelpers() {
 
   /** 读「深度思考 / 智能搜索」开关状态 */
   function toggleState(label) {
+    // label 可以是字符串或数组：页面会跟着语言变（中文「深度思考」/ 英文 DeepThink）
+    const labels = Array.isArray(label) ? label : [label];
     const buttons = document.querySelectorAll('.ds-toggle-button');
     for (const el of buttons) {
-      if (!(el.innerText || '').includes(label)) continue;
+      // 用 textContent：开关里的文字在 innerText 下可能为空（图标布局/溢出），会导致「找不到开关」
+      const text = el.textContent || '';
+      if (!labels.some((item) => text.includes(item))) continue;
       return {
         found: true,
         selected: el.classList.contains('ds-toggle-button--selected'),
@@ -381,15 +386,76 @@ export function installPageHelpers() {
   }
 
   function clickToggle(label) {
+    const labels = Array.isArray(label) ? label : [label];
     const buttons = document.querySelectorAll('.ds-toggle-button');
     for (const el of buttons) {
-      if ((el.innerText || '').includes(label) && isVisible(el)) {
+      const text = el.textContent || '';
+      if (labels.some((item) => text.includes(item)) && isVisible(el)) {
         el.click();
         return true;
       }
     }
     return false;
   }
+
+  /**
+   * 统一的请求头构造（页内直发用）。
+   * token 有两种形态：{"value":"<明文>"} 或 {"value":{"ownerHash","jwt"}}；device id 在 localStorage 里。
+   */
+  window.__DSW_HEADERS__ = function () {
+    const readToken = () => {
+      try {
+        const raw = localStorage.getItem('userToken');
+        if (!raw) return '';
+        const value = JSON.parse(raw)?.value;
+        if (typeof value === 'string') return value;
+        if (value && typeof value === 'object') return value.jwt || '';
+        return '';
+      } catch {
+        return '';
+      }
+    };
+    const token = window.__DSW_LAST_AUTH__ || readToken();
+    const deviceId = (() => {
+      try {
+        return localStorage.getItem('deepseek-device-id:chat') || '';
+      } catch {
+        return '';
+      }
+    })();
+    return {
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      'x-client-bundle-id': 'com.deepseek.chat',
+      'x-client-platform': 'web',
+      'x-client-version': '2.8.0',
+      'x-client-locale': 'zh_CN',
+      'x-client-timezone-offset': String(-new Date().getTimezoneOffset() * 60),
+      'x-device-id': deviceId,
+      'x-device-model': '',
+      accept: '*/*',
+    };
+  };
+
+  // 钩住页面自己的 Authorization（新版 token 由前端解密后使用，直接复用最可靠）
+  try {
+    const origFetch = window.fetch;
+    window.fetch = function (input, init) {
+      try {
+        const headers = (init && init.headers) || (input && input.headers);
+        const grab = (v) => {
+          if (typeof v === 'string' && v.toLowerCase().startsWith('bearer ')) {
+            window.__DSW_LAST_AUTH__ = v.slice(7).trim();
+          }
+        };
+        if (headers) {
+          if (typeof headers.get === 'function') grab(headers.get('authorization'));
+          else if (Array.isArray(headers)) headers.forEach(([k, v]) => String(k).toLowerCase() === 'authorization' && grab(v));
+          else Object.entries(headers).forEach(([k, v]) => String(k).toLowerCase() === 'authorization' && grab(v));
+        }
+      } catch {}
+      return origFetch.apply(this, arguments);
+    };
+  } catch {}
 
   function bodyText() {
     return document.body ? document.body.innerText || '' : '';
@@ -401,7 +467,9 @@ export function installPageHelpers() {
       return true;
     }
     const text = bodyText();
-    return /人机验证|请完成验证|请先完成下方验证|拖动滑块|verify you are human/i.test(text);
+    return /人机验证|请完成验证|请先完成下方验证|拖动滑块|verify you are human|complete the captcha|please complete the verification/i.test(
+      text,
+    );
   }
 
   function detectNotice() {
@@ -470,8 +538,11 @@ export function installPageHelpers() {
         out.answer = serialize(answerEl, { streaming });
         out.hasAnswer = Boolean(out.answer);
         // 生成长按/朗读/复制这些操作按钮只在回答结束后出现
+        // 操作按钮（朗读 / 重新生成）只在回答结束后出现；中英两套文案都要认
         const actions = (last.closest('[data-virtual-list-item-key]') || last).querySelectorAll(
-          '[aria-label="朗读"], [aria-label="重新生成"]',
+          '[aria-label="朗读"], [aria-label="重新生成"], ' +
+            '[aria-label="Read aloud"], [aria-label="Read Aloud"], [aria-label="Regenerate"], ' +
+            '[aria-label="重新生成回答"]',
         );
         out.answerComplete = actions.length > 0;
       }
@@ -480,7 +551,10 @@ export function installPageHelpers() {
     out.stopVisible = detectGenerating();
     out.generating = out.stopVisible;
     out.captcha = detectCaptcha();
-    out.rateLimited = /(发送|请求|操作)过于频繁|连续访问次数过多/.test(bodyText());
+    // 限流提示：中文两种写法 + 英文很窄的句式（别用泛化的 rate limit，回答正文里出现会误判）
+    out.rateLimited = /(发送|请求|操作)过于频繁|连续访问次数过多|too many requests|sending too frequently|request too frequent/i.test(
+      bodyText(),
+    );
     out.notice = detectNotice();
 
     return out;

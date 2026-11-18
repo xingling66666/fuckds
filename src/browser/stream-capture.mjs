@@ -24,7 +24,7 @@ import {
   createSseParser,
   createStreamState,
   reasoningOf,
-} from '../direct/stream.mjs';
+} from '../sse/patch.mjs';
 
 /** 页面补全接口路径（真实接口形如 /api/v0/chat/completion?...) */
 export const COMPLETION_PATH = '/api/v0/chat/completion';

@@ -1,73 +1,130 @@
 /**
  * 工具声明 / 调用解析。
  *
- * 约定（与网页 prompt 中的 ## Tool_functions 段落一致）：
- *   {"name":"exec_shell","description":"Exec shell command","parameters":{...}}
+ * 工具声明（网页 prompt 的 ## Tools 段）有两种渲染模式：
+ *   compact（默认推荐）：每行一个工具的完整 JSON —— {"name":...,"description":...,"parameters":...}
+ *   full：函数签名 + 缩进参数说明（人话，不是 JSON）
  *
- * 模型输出工具调用只走一种语法：**原生 DSML**（XML 风格调用，见 dsml.mjs）。
+ * 模型输出工具调用只走一种语法：**DSML**（网页版原生的 XML 风格块）：
+ *
+ *   <｜DSML｜calls><｜DSML｜invoke name="exec_shell">
+ *   <｜DSML｜parameter name="command" string="true">uname -a</｜DSML｜parameter>
+ *   </｜DSML｜invoke></｜DSML｜calls>
+ *
  * 解析层把它转成标准 tool_calls / tool_use，再从 content / SSE 里剔除；
- * 历史里绝不回写 DSML，只写 ## Tool_calls 段的 JSON 行。
+ * 历史里回写的也是同样形状的 DSML 块（见 build.mjs）。
  *
- * 为了不丢调用，<tool_call> JSON 和 <|tool▁calls▁begin|> 这类原生工具 token 仍然静默兜底解析，
- * 但不再区分、也不再记日志（它们不是对外协议，只是容错）。
+ * 为了不丢调用，旧格式仍然静默兜底解析（不再对外教学、也不记日志）：
+ * - <tool_call> / 原生工具 token / 旧版 DO。
+ *
+ * 注意：解析只是入口，**回写上下文时一律转成我们的密文块**（见 build.mjs）。
+ * 模型输出什么格式都行，它能看到的样例永远只有一种，权重才会往我们的格式上收。
  */
 
-import { parseDsmlCalls } from './dsml.mjs';
+import { parseToolCallsAny } from './toolformat.mjs';
 
-/** 把 OpenAI tools 定义渲染成「每行一个 JSON」的工具列表 */
 /** 压缩索引里描述保留多少字符 */
 const COMPACT_DESC_CHARS = 60;
 
 /**
- * 压缩版工具声明：一行一个工具，只保留「能选对工具 + 能拼出必填参数」所需的信息。
+ * 参数类型的人话描述（full 模式用，**不输出 JSON Schema**）。
  *
- *   bash(command:string*, timeout:number) — 执行 shell 命令
+ * 类型映射：
+ *   string → text          integer → whole number     number → number
+ *   boolean → yes/no       array → list of <item>     object → object
+ *   enum → a | b | c       （必填参数不带问号）
+ */
+function describeType(schema) {
+  if (!schema || typeof schema !== 'object') return 'any';
+  if (Array.isArray(schema.enum) && schema.enum.length) {
+    return schema.enum.map((v) => (typeof v === 'string' ? v : JSON.stringify(v))).join(' | ');
+  }
+  if (Array.isArray(schema.type)) return schema.type.map((t) => describeType({ ...schema, type: t })).join(' or ');
+  switch (schema.type) {
+    case 'string':
+      return 'text';
+    case 'integer':
+      return 'whole number';
+    case 'number':
+      return 'number';
+    case 'boolean':
+      return 'yes/no';
+    case 'array':
+      return `list of ${describeType(schema.items)}`;
+    case 'object':
+      return 'object';
+    default:
+      return 'any';
+  }
+}
+
+/** 一行的函数签名：exec_shell(command: text, timeout?: number) */
+function renderSignature(name, parameters) {
+  const props = parameters?.properties && typeof parameters.properties === 'object' ? parameters.properties : {};
+  const required = new Set(Array.isArray(parameters?.required) ? parameters.required : []);
+  const parts = Object.entries(props).map(([key, schema]) => {
+    const type = describeType(schema);
+    return required.has(key) ? `${key}: ${type}` : `${key}?: ${type}`;
+  });
+  return `${name}(${parts.join(', ')})`;
+}
+
+/**
+ * 压缩版工具声明：**每行一个工具的完整 JSON**。
  *
- * 为什么需要：agent 动辄上百个工具，完整 JSON 声明能到 100KB，超过网页输入框上限，
+ * 输出形状（严格单行，可直接 JSON.parse）：
+ *   {"name":"exec_shell","description":"Exec shell command","parameters":{"type":"object","properties":{...}}}
+ *
+ * 为什么需要紧凑：agent 动辄上百个工具，完整声明能到 100KB，超过网页输入框上限，
  * 以前会被整段挪进附件 —— 模型在正文里看不到工具声明，就会乱调工具
- * （参数结构凭臆测，缺必填字段），最后干脆停摆。压缩后体积约剩 1/10。
+ * （参数结构凭臆测，缺必填字段），最后干脆停摆。每行一个 JSON 既紧凑又结构化。
  *
- * 星号标必填。描述截断只为省体积，选型够用即可；需要精确 schema 时走按需展开。
+ * 字段裁剪：
+ * - description 压成单行并截断到 COMPACT_DESC_CHARS 字符，避免单行过长；
+ * - parameters 原样保留（模型需要完整的 properties / required 才能正确填参）。
  */
 export function renderCompactToolDeclarations(tools = []) {
   const lines = [];
   for (const tool of tools) {
     const fn = tool?.function ?? tool;
     if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
-
-    const params = fn.parameters?.properties;
-    const required = new Set(Array.isArray(fn.parameters?.required) ? fn.parameters.required : []);
-    const args = params && typeof params === 'object'
-      ? Object.entries(params).map(([key, value]) => {
-          const type = value?.type || 'any';
-          return `${key}:${type}${required.has(key) ? '*' : ''}`;
-        })
-      : [];
-
     const desc = String(fn.description ?? '')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, COMPACT_DESC_CHARS);
-
-    lines.push(`${fn.name.trim()}(${args.join(', ')})${desc ? ` — ${desc}` : ''}`);
+    const record = {
+      name: fn.name.trim(),
+      description: desc,
+      parameters: fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : { type: 'object', properties: {} },
+    };
+    lines.push(JSON.stringify(record));
   }
   return lines;
 }
 
+/**
+ * 完整工具声明：一行签名 + 缩进的参数说明（可选）。
+ *
+ * 复杂工具（嵌套对象、枚举）靠"类型描述"已经够用；这里额外把每个参数自带的
+ * description 缩进写出来，给模型选参数时做参考。整块仍然是纯文本，没有 JSON。
+ */
 export function renderToolDeclarations(tools = []) {
   const lines = [];
   for (const tool of tools) {
     const fn = tool?.function ?? tool;
     if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
-    const decl = { name: fn.name.trim() };
-    if (fn.description) decl.description = String(fn.description);
-    if (fn.parameters && typeof fn.parameters === 'object') decl.parameters = fn.parameters;
-    // required 原来只藏在 parameters.required 里，模型很容易漏看；
-    // 在顶层再写一份，提示词里的“全部必填参数必须出现”才有可对照的清单。
-    if (Array.isArray(fn.parameters?.required) && fn.parameters.required.length) {
-      decl.required = fn.parameters.required;
+    const name = fn.name.trim();
+    const desc = String(fn.description ?? '').replace(/\s+/g, ' ').trim();
+    lines.push(desc ? `${renderSignature(name, fn.parameters)} — ${desc}` : renderSignature(name, fn.parameters));
+
+    const props = fn.parameters?.properties;
+    if (props && typeof props === 'object') {
+      for (const [key, schema] of Object.entries(props)) {
+        const note = String(schema?.description ?? '').replace(/\s+/g, ' ').trim();
+        if (!note) continue;
+        lines.push(`  ${key}: ${note}`);
+      }
     }
-    lines.push(JSON.stringify(decl));
   }
   return lines;
 }
@@ -81,6 +138,30 @@ export function getToolSchemas(tools = []) {
     map.set(fn.name.trim(), fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : null);
   }
   return map;
+}
+
+/**
+ * `<description>` 默认已经并进 arguments（很多客户端把它声明成必填参数）。
+ * 但如果这个工具的声明里**没有** description 参数，就把它裁掉 ——
+ * 否则 `additionalProperties: false` 的严格客户端会直接拒绝这次调用。
+ */
+function trimUnsupportedDescription(call, toolSchemas) {
+  if (!toolSchemas || typeof toolSchemas.get !== 'function') return call.arguments;
+  const schema = toolSchemas.get(call.name);
+  if (!schema || typeof schema !== 'object') return call.arguments;
+  const props = schema.properties;
+  if (!props || typeof props !== 'object') return call.arguments;
+  if (Object.prototype.hasOwnProperty.call(props, 'description')) return call.arguments;
+
+  let args;
+  try {
+    args = JSON.parse(call.arguments);
+  } catch {
+    return call.arguments;
+  }
+  if (!args || typeof args !== 'object' || !('description' in args)) return call.arguments;
+  delete args.description;
+  return JSON.stringify(args);
 }
 
 function tryParseJson(text) {
@@ -168,7 +249,7 @@ function coerceScalar(value, schema, path, warnings) {
  *
  * 纠正只做“类型可无歧义还原”的事，绝不编造缺失值：
  * - "10" -> 10（integer）、"true" -> true（boolean）、"[\"a\"]" -> ["a"]（array）
- *   —— 这正是 DSML 里 string="true" / 省略 string 属性时最常见的错法；
+ *   —— 模型在 DSML 里把数字 / 布尔写成字符串时最常见的错法；
  * - 大小写写错的参数名（Query -> query）按声明改名；
  * - 整个参数对象被包进一层 args/arguments/parameters 时拆掉一层；
  * - 必填缺失、枚举不符、无法还原的类型只警告、不改动、不丢弃调用：
@@ -276,7 +357,7 @@ export function readJsonObject(text, start) {
 /**
  * 旧版 DO 行（`DO:{"name":...}`）的容错解析。
  *
- * 新协议里 prompt / 历史都不再出现 DO（历史调用走 ## Tool_calls 的 JSON 行），
+ * 新协议里 prompt / 历史都不再出现 DO（历史调用走 ## FTC 的 JSON 行），
  * 这里保留只是兜底：万一模型/旧客户端还吐 DO，不丢调用、也不报错、不记日志。
  */
 const DO_PATTERN = /\bDO\b[ \t*_`~]{0,6}[:：=][ \t*_`~]{0,6}\s*/g;
@@ -482,11 +563,14 @@ function parseNativeToolCalls(text, add) {
  * 「模型未返回正文或工具调用」。未知名字照实返回，由客户端自己回一条 unknown tool，
  * agent 才能自我纠正、loop 才能继续（这也和 OpenAI 兼容接口的既有行为一致）。
  *
+ * knownTools 只传给兜底格式的识别启发式（DSML 靠标签定界，不靠工具名），
+ * **不参与**过滤。
+ *
  * @param {string} text
- * @param {string[]} [knownTools] 保留参数：仅用于调用方日志（哪些名字是没声明的），不再参与过滤
+ * @param {string[]} [knownTools] 声明过的工具名，仅用于识别启发式与调用方日志
  * @returns {{ name: string, arguments: string, raw: string, index: number }[]}
  */
-export function parseToolCalls(text, knownTools = null) {
+export function parseToolCalls(text, knownTools = null, { toolSchemas = null } = {}) {
   if (!text || typeof text !== 'string') return [];
   const calls = [];
   const seen = new Set();
@@ -500,9 +584,10 @@ export function parseToolCalls(text, knownTools = null) {
     calls.push({ name, arguments: argsJson, raw, index });
   };
 
-  // 1) DSML：唯一对外语法（全角 / 半角竖线、截断都能解析）
-  for (const call of parseDsmlCalls(text)) {
-    add(call.name, call.arguments, call.raw, call.index);
+  // 1) 工具调用块：代码块 / XML / DSML（knownTools 决定哪些算合法调用）
+  const known = Array.isArray(knownTools) ? knownTools : null;
+  for (const call of parseToolCallsAny(text, known, { toolSchemas })) {
+    add(call.name, trimUnsupportedDescription(call, toolSchemas), call.raw, call.index);
   }
 
   // 2) <tool_call>{...}</tool_call>：缺闭合标签时按截断处理
@@ -531,7 +616,7 @@ export function parseToolCalls(text, knownTools = null) {
 }
 
 /**
- * 有些模型在原生格式（DSML / <tool_call> / 原生 token / 旧版 DO）里会把包装对象原样塞进参数：
+ * 有些模型在 DSML / 旧格式里会把包装对象原样塞进参数：
  *
  *   {"name":"bash","args":{"description":"...","command":"..."}}
  *   {"name":"bash","args":"{\"description\":...,\"command\":...}"}
@@ -580,16 +665,37 @@ export function normalizeArguments(args) {
   return JSON.stringify(unwrapCallArguments(value));
 }
 
-/** 工具执行结果 -> ## Tool_call_result 段里的一行 JSON */
-export function renderToolResult(name, content) {
-  const result = typeof content === 'string' ? content : JSON.stringify(content);
-  return `${JSON.stringify({ name: name || 'unknown', result })}`;
-}
-
+/** 工具执行结果 -> ## FTCR 段里的一行 JSON */
 /** 统计工具名（给调用方做「模型调了没声明的工具」这类日志/诊断用） */
 export function collectToolNames(tools = []) {
   return tools
     .map((t) => (t?.function ?? t)?.name)
     .filter((n) => typeof n === 'string' && n.trim())
     .map((n) => n.trim());
+}
+
+/**
+ * 散文式声明：一行一个「名字 —— 干什么（参数 a, b）」，完全不含 JSON / schema 字样。
+ *
+ * 为什么不用 JSON：{"name":..,"parameters":{"type":"object","properties":..}}
+ * 这种结构一旦出现在对话里，就是"客户端在喂 API schema"的铁证。
+ */
+export function renderProseToolDeclarations(tools = []) {
+  const lines = [];
+  for (const tool of tools) {
+    const fn = tool?.function ?? tool;
+    const name = String(fn?.name || '').trim();
+    if (!name) continue;
+    const desc = String(fn?.description || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    const props = fn?.parameters?.properties;
+    const required = new Set(Array.isArray(fn?.parameters?.required) ? fn.parameters.required : []);
+    const params = props && typeof props === 'object'
+      ? Object.entries(props).map(([k, v]) => {
+          const t = String(v?.type || '');
+          return `${k}${required.has(k) ? '' : '?'}${t ? `:${t}` : ''}`;
+        })
+      : [];
+    lines.push(`${name} —— ${desc || '（无说明）'}${params.length ? `（${params.join(', ')}）` : ''}`);
+  }
+  return lines;
 }

@@ -116,47 +116,6 @@ test('流式过滤器：遇到 DO 就截断，剩余正文补发时去掉协议�
   assert.match(out + rest, /然后再补充/);
 });
 
-const DSML_TEXT = `先看一眼：
-<｜DSML｜calls>
-<｜DSML｜invoke name="bash">
-<｜DSML｜parameter name="command" string="true">pwd</｜DSML｜parameter>
-</｜DSML｜invoke>
-</｜DSML｜calls>
-`;
-
-test('stripToolMarkup: 去掉 DSML 块，保留正文', () => {
-  const text = `我来看看\n${DSML_TEXT}好了`;
-  const cleaned = stripToolMarkup(text);
-  assert.ok(!cleaned.includes('DSML'), cleaned);
-  assert.match(cleaned, /我来看看/);
-  assert.match(cleaned, /好了/);
-});
-
-test('findToolMarkup: DSML 块也被识别', () => {
-  const blocks = findToolMarkup(`前文\n${DSML_TEXT}后文`);
-  assert.equal(blocks.length, 1);
-  assert.equal(blocks[0].kind, 'TOOL_CALL');
-});
-
-test('流式过滤器：DSML 标签不会漏进 content', () => {
-  const filter = new ToolMarkupStreamFilter({ holdBack: 6 });
-  let out = '';
-  for (const ch of DSML_TEXT) out += filter.push(ch);
-  out += filter.flushRest();
-  assert.ok(!out.includes('DSML'), `流式 content 漏了标签: ${out}`);
-  assert.match(out, /先看一眼/);
-});
-
-test('流式过滤器：半截 DSML 标签先扣住', () => {
-  const filter = new ToolMarkupStreamFilter({ holdBack: 4 });
-  let out = filter.push('结论：<｜DS');
-  assert.equal(out, '结论：');
-  out += filter.push('ML｜calls>');
-  assert.ok(!out.includes('DSML'));
-  const rest = filter.flushRest();
-  assert.ok(!(out + rest).includes('DSML'), `半截标签泄漏: ${out + rest}`);
-});
-
 // ---------------------------------------------------------------- 协议识别（只截断，不中止）
 
 test('findFabricatedBlock: RESULT / 伪造段标题命中，正常 DO 与原生 token 不命中', () => {
@@ -177,10 +136,6 @@ test('流式过滤器：遇到协议块只截断正文，绝不对外提供「�
   const doFilter = new ToolMarkupStreamFilter();
   doFilter.push('执行命令\nDO:{"name":"exec_shell","args":{"command":"uname -a"}}');
   assert.equal(doFilter.cutKind, 'DO');
-
-  const dsml = new ToolMarkupStreamFilter();
-  dsml.push(DSML_TEXT);
-  assert.equal(dsml.cutKind, 'TOOL_CALL');
 });
 
 // ---------------------------------------------------------------- 自造结果

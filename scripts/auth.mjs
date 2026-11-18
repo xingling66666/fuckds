@@ -1,112 +1,89 @@
-#!/usr/bin/env node
-/**
- * 管理 DeepSeek 网页登录态（userToken），支持号池。
- *
- * 用法：
- *   npm run auth -- <token1> [token2 ...]   # 追加/覆盖为这些 token
- *   npm run auth                            # 交互式粘贴一个
- *   npm run auth -- --list                  # 查看号池
- *   npm run auth -- --check                 # 校验第一个 token
- *
- * userToken 位置：浏览器 F12 → Application → Local Storage →
- * https://chat.deepseek.com → userToken → 复制 value 字段。
- */
-import readline from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
+import { chromium } from 'playwright';
 
 import { loadConfig } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
-import { loadTokens, maskToken, normalizeUserToken, saveTokens } from '../src/auth.mjs';
-import { createEngine } from '../src/engine.mjs';
+import { loginWithBrowser, persistLogin, readToken } from '../src/browser/login.mjs';
+import { buildLaunchEnv, resolveChromiumExecutable } from '../src/browser/env.mjs';
 
-const args = process.argv.slice(2);
-const checkOnly = args.includes('--check');
-const listOnly = args.includes('--list');
-const rawArgs = args.filter((a) => !a.startsWith('--'));
+/**
+ * 命令行登录：真浏览器 → 密码 → （必要时）数美点选 + 邮箱验证码 → 落盘 token。
+ *
+ * 用法：
+ *   npm run auth                                  # 用 DS_EMAIL / DS_PASSWORD
+ *   npm run auth -- --email a@b.com --password xx
+ *   node scripts/auth.mjs --headed=false          # 无头（更容易被要求验证码）
+ *
+ * 需要的环境变量（读验证码用）：
+ *   MAIL_USER=xxx@gmail.com
+ *   MAIL_PASS=<Gmail 应用专用密码>
+ */
+function argOf(name, fallback = '') {
+  const i = process.argv.indexOf(`--${name}`);
+  if (i > 0 && process.argv[i + 1]) return process.argv[i + 1];
+  const kv = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return kv ? kv.split('=').slice(1).join('=') : fallback;
+}
 
-const config = loadConfig();
-const logger = createLogger('info', 'auth');
+const flagOf = (name, fallback = false) => {
+  if (process.argv.includes(`--${name}`)) return true;
+  if (process.argv.includes(`--no-${name}`)) return false;
+  const kv = process.argv.find((a) => a.startsWith(`--${name}=`));
+  if (kv) return kv.split('=')[1] !== 'false';
+  return fallback;
+};
 
-if (listOnly) {
-  const tokens = loadTokens(config);
-  if (!tokens.length) {
-    console.log('号池是空的，先执行 npm run auth -- <userToken>');
+async function main() {
+  const config = loadConfig();
+  const logger = createLogger({ level: config.logLevel ?? 'info' });
+  const email = argOf('email', config.login?.email || process.env.DS_EMAIL || '');
+  const password = argOf('password', config.login?.password || process.env.DS_PASSWORD || '');
+  const headless = flagOf('headed', true) === false;
+
+  if (!email || !password) {
+    console.error('缺少账号密码：设置 DS_EMAIL / DS_PASSWORD，或 --email / --password');
     process.exit(1);
   }
-  console.log(`号池：${tokens.length} 个 token（${config.authFile}）`);
-  tokens.forEach((token, i) => console.log(`  #${i + 1}  ${maskToken(token)}`));
-  process.exit(0);
-}
 
-let tokens = loadTokens(config);
-
-if (!checkOnly) {
-  let candidates = rawArgs.length ? rawArgs : [];
-  if (!candidates.length) {
-    const rl = readline.createInterface({ input, output });
-    console.log('');
-    console.log('请粘贴 userToken（多个用空格/逗号分隔）：');
-    const answer = (await rl.question('> ')).trim();
-    rl.close();
-    candidates = answer.split(/[\s,;]+/).filter(Boolean);
-  }
-  if (!candidates.length) {
-    console.error('没有拿到 token，已退出');
-    process.exit(1);
-  }
-  const normalized = candidates.map((t) => normalizeUserToken(t));
-  const merged = args.includes('--replace') ? normalized : [...new Set([...tokens, ...normalized])];
-  saveTokens(config, merged);
-  tokens = merged;
-  logger.info(`号池已保存 ${tokens.length} 个 token：${tokens.map(maskToken).join(' | ')}`);
-}
-
-if (!tokens.length) {
-  console.error('没有可用的 token：请执行 npm run auth -- <userToken>');
-  process.exit(1);
-}
-
-logger.info(`校验第 1 个 token（${maskToken(tokens[0])}）…`);
-
-let engine;
-let exitCode = 0;
-try {
-  // 用当前配置的引擎校验（默认 browser：真实打开网页看登录态；direct：调一次补全）
-  engine = createEngine({
-    config: { ...config, deepseek: { ...config.deepseek, tokens, token: tokens[0] } },
-    logger,
+  const browser = await chromium.launch({
+    headless,
+    executablePath: resolveChromiumExecutable(config),
+    env: buildLaunchEnv(config, logger),
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
+      '--no-first-run',
+    ],
   });
-  if (typeof engine.checkLogin === 'function') {
-    const login = await engine.checkLogin();
-    if (login.ok) {
-      logger.info(`✅ 登录态有效（已进入对话页：${login.url || 'chat.deepseek.com'}）`);
-    } else if (login.captcha) {
-      logger.error('❌ 打开页面时遇到人机验证，请先在浏览器里手动通过 / 换网络后重试');
-      exitCode = 1;
-    } else {
-      logger.error('❌ token 无效或已过期：打开网页后没有进入对话页');
-      exitCode = 1;
-    }
-  } else {
-    const result = await engine.chat({
-      prompt: '# MESSAGES:\n## USER_ROLE_MESSAGES:\n只回复：ok',
-      thinking: false,
+  const context = await browser.newContext({
+    viewport: { width: 1512, height: 950 },
+    locale: 'zh-CN',
+    timezoneId: process.env.TZ || 'Asia/Shanghai',
+  });
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+
+  const page = await context.newPage();
+  try {
+    const out = await loginWithBrowser(page, {
+      email,
+      password,
+      log: (m) => logger.info(`[login] ${m}`),
     });
-    logger.info(`✅ 登录态有效（返回：${JSON.stringify(result.text.slice(0, 20))}）`);
+    const { authFile } = persistLogin({ config, ...out });
+    const again = await readToken(page);
+    logger.info(`已保存 token 到 ${authFile}`);
+    console.log(JSON.stringify({ ok: true, authFile, token: `${again.token?.slice(0, 10)}…`, deviceId: again.deviceId }, null, 2));
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
   }
-} catch (err) {
-  if (err.code === 'deepseek_rate_limited') {
-    logger.warn('⚠️ 账号当前被限流，token 本身可能是好的，稍后再试');
-    exitCode = 0;
-  } else if (err.name === 'AuthExpiredError') {
-    logger.error('❌ token 无效或已过期');
-    exitCode = 1;
-  } else {
-    logger.error('❌ 校验失败:', err.message);
-    exitCode = 1;
-  }
-} finally {
-  await engine?.close().catch(() => {});
 }
 
-process.exit(exitCode);
+main().catch((err) => {
+  console.error(`登录失败：${err.message}`);
+  process.exit(1);
+});

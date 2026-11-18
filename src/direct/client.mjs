@@ -11,6 +11,27 @@ import {
   typingDelay,
 } from './fingerprint.mjs';
 import { PowSolver } from './pow.mjs';
+import { openTokenStore } from '../token-store.mjs';
+const sha1 = (text) => crypto.createHash('sha1').update(String(text)).digest('hex');
+
+/**
+ * 消息前缀签名。
+ *
+ * 必须**忽略 system/developer 的正文**：agent 框架常在 system 里塞时间戳、随机 id、
+ * 变化的工具列表，正文一变签名就变 → 永远判定「不是同一段对话」→ 每轮全量重放。
+ * 用户/助手/工具三类消息的内容才代表"同一段对话进行到哪了"。
+ */
+const prefixSignature = (messages, count) =>
+  sha1(
+    JSON.stringify(
+      (messages || []).slice(0, count).map((m) => {
+        const role = String(m?.role || '');
+        if (role === 'system' || role === 'developer') return { role };
+        return { role, content: m?.content ?? null, tool_calls: m?.tool_calls ?? null };
+      }),
+    ),
+  );
+
 import { applyPatch, createSseParser, createStreamState, createTextTracker } from './stream.mjs';
 
 const COMPLETION_PATH = '/api/v0/chat/completion';
@@ -102,7 +123,10 @@ export function powNotExpired(expireAt, now = Date.now(), safetyMs = POW_EXPIRY_
  * PoW 用 Go 求解（bin/ds-pow），14.4 万次搜索约 20–30ms。
  */
 export class DirectEngine {
-  constructor({ config, logger }) {
+  /**
+   * @param {object} [opts.powSolver] 注入 PoW 求解器（测试用；默认起 bin/ds-pow 子进程）
+   */
+  constructor({ config, logger, powSolver = null }) {
     this.config = config;
     this.log = logger;
     this.baseUrl = config.deepseek.baseUrl.replace(/\/+$/, '');
@@ -110,8 +134,23 @@ export class DirectEngine {
       ? config.deepseek.tokens
       : [config.deepseek.token].filter(Boolean);
 
-    this.pool = new AccountPool({ tokens: this.tokens, dataDir: config.dataDir, logger });
-    this.pow = new PowSolver({ bin: config.direct.powBin, logger });
+    this.pool = new AccountPool({
+      tokens: this.tokens,
+      dataDir: config.dataDir,
+      logger,
+      // 判失效就写库打标 → 之后重建号池时自然跳过，不需要轮询探活
+      onAuthFailure: (token, reason) => {
+        try {
+          const store = openTokenStore({ dataDir: this.config.dataDir });
+          if (store.markRevoked(token, reason)) {
+            this.log?.warn?.(`账号已标记吊销：${String(token).slice(0, 8)}…（${reason}）`);
+          }
+        } catch {
+          /* 忽略 */
+        }
+      },
+    });
+    this.pow = powSolver || new PowSolver({ bin: config.direct.powBin, logger });
     this.fileCache = new Map();
     /**
      * 上传得到的 file id → 上传它的账号 index。
@@ -122,6 +161,17 @@ export class DirectEngine {
      */
     this.fileOwners = new Map();
     this.inflight = 0;
+    /**
+     * 粘性会话表：key = conversationKey（上游按「调用方 + 首条消息」算的哈希）。
+     *
+     * 每条记录：{ sessionId, parentMessageId, consumedCount, sig, accountIndex, lastUsed }
+     * - consumedCount：这个上游会话里已经发过多少条消息（增量 prompt 从这之后切）
+     * - sig：已发送消息前缀的 sha1，用来确认「这次请求确实延续了同一段对话」
+     * - accountIndex：会话绑定的账号（会话是账号私有的，换号必须重建）
+     */
+    this.sessions = new Map();
+    this.sessionTtlMs = 30 * 60_000;
+    this.sessionMax = 500;
     this.closed = false;
     this.coldStarted = false;
   }
@@ -165,6 +215,127 @@ export class DirectEngine {
     this.log.debug(`账号 #${account.index + 1} 冷启动完成`, { did });
   }
 
+  /**
+   * 热更新号池：后台加号 / 删号、或者自动登录刚拿到新 token 时调用，不用重启进程。
+   *
+   * 传 tokens 就按传入的来；不传就从 token-store 读当前号池。
+   * 同一个 token 的冷却 / 失效 / 计数状态要**原样搬过去**：
+   * 换号池不该把好号的冷却清零（会被重复打），也不该把已失效的号洗白
+   * （否则每加一次号都要把坏号重新撞一遍，白付一次 session + PoW）。
+   */
+  /**
+   * @param {string[]} tokens
+   * @param {{allowEmpty?: boolean, pool?: string|null}} [options]
+   *   allowEmpty: 允许把号池清空（solver 池专用，不能回退到主池）
+   *   pool: 回退时只从该池读（不给就全量）
+   */
+  reloadTokens(tokens, { allowEmpty = false, pool = null } = {}) {
+    let list = Array.isArray(tokens) ? tokens.filter(Boolean) : null;
+    if (allowEmpty && Array.isArray(list)) {
+      const unique0 = [...new Set(list)];
+      this.pool = new AccountPool({ tokens: unique0, dataDir: this.config.dataDir, logger: this.log });
+      this.tokens = unique0;
+      this.config.deepseek.token = unique0[0] || '';
+      this.config.deepseek.tokens = unique0;
+      this.log?.info?.(`号池已热更新：${unique0.length} 个 token（独立池，不回退）`);
+      return { tokens: unique0.length, changed: true };
+    }
+    if (!list || !list.length) {
+      try {
+        const store = openTokenStore({ dataDir: this.config.dataDir });
+        list = store
+          .list(pool)
+          .map((row) => row.token)
+          .filter(Boolean);
+      } catch {
+        list = null;
+      }
+    }
+    if (!Array.isArray(list) || !list.length) {
+      return { tokens: this.tokens.length, changed: false };
+    }
+    const unique = [...new Set(list)];
+    const before = new Map(this.pool.accounts.map((account) => [account.token, account]));
+    const next = new AccountPool({
+      tokens: unique,
+      dataDir: this.config.dataDir,
+      logger: this.log,
+      onAuthFailure: (token, reason) => {
+        try {
+          const store = openTokenStore({ dataDir: this.config.dataDir });
+          if (store.markRevoked(token, reason)) {
+            this.log?.warn?.(`账号已标记吊销：${String(token).slice(0, 8)}…（${reason}）`);
+          }
+        } catch {
+          /* 忽略 */
+        }
+      },
+    });
+    for (const account of next.accounts) {
+      const prev = before.get(account.token);
+      if (!prev) continue;
+      if (prev.deviceId) account.deviceId = prev.deviceId;
+      account.cooldownUntil = prev.cooldownUntil;
+      account.limitedCount = prev.limitedCount;
+      account.errorCount = prev.errorCount;
+      account.lastError = prev.lastError;
+      account.authFailed = prev.authFailed;
+      account.lastFailureKind = prev.lastFailureKind;
+      account.lastUsedAt = prev.lastUsedAt;
+      account.requests = prev.requests;
+      account.powNext = prev.powNext;
+      account.sessionPool = prev.sessionPool;
+    }
+    this.pool = next;
+    this.tokens = unique;
+    this.config.deepseek.token = unique[0];
+    this.config.deepseek.tokens = unique;
+    this.log?.info?.(`号池已热更新：${unique.length} 个 token（无需重启）`);
+    return { tokens: unique.length, changed: true };
+  }
+
+  /**
+   * 只读探活：GET /api/v0/users/current。
+   *
+   * 这个接口没有任何业务副作用（不建会话、不触发 PoW、不写消息），
+   * 是判断「这枚 token 还能不能用」最便宜的方式；体检、后台状态都走它。
+   * 注意 DeepSeek 的失效信号是 HTTP 200 + code=40003，不能看状态码。
+   */
+  async checkLogin({ token } = {}) {
+    const target =
+      (token && this.pool.accounts.find((account) => account.token === token)) ||
+      this.pool.accounts.find((account) => account.cooldownUntil <= Date.now()) ||
+      this.pool.accounts[0];
+    if (!target) {
+      return { ok: false, code: 40002, msg: '还没有配置 token', url: undefined };
+    }
+    try {
+      const res = await fetch(`${this.baseUrl}/api/v0/users/current`, {
+        method: 'GET',
+        headers: this.#headers(target),
+      });
+      const body = await readJsonSafely(res);
+      const code = Number(body?.code ?? (res.ok ? 0 : res.status));
+      const msg = body?.msg || body?.data?.biz_msg || (res.ok ? '' : `HTTP ${res.status}`);
+      const user = body?.data?.biz_data?.user ?? null;
+      return {
+        ok: code === 0,
+        code,
+        msg,
+        url: `${this.baseUrl}/api/v0/users/current`,
+        user: user ? { email: user.email ? String(user.email).replace(/^(..).*@/, '$1***@') : '' } : null,
+      };
+    } catch (err) {
+      return { ok: false, code: null, msg: err.message || '探活请求失败', url: `${this.baseUrl}/api/v0/users/current` };
+    }
+  }
+
+  /** admin 的「体检」用同一套语义：alive + code + msg */
+  async probe() {
+    const r = await this.checkLogin();
+    return { alive: Boolean(r.ok), code: r.code, msg: r.msg };
+  }
+
   status() {
     return {
       engine: 'direct',
@@ -187,7 +358,51 @@ export class DirectEngine {
    * 请求
    * ------------------------------------------------------------------ */
 
-  async chat({ prompt, thinking = false, search = false, refFileIds = [], signal, onDelta, onThinking, meta = {} }) {
+  async chat({
+    prompt,
+    thinking = false,
+    search = false,
+    refFileIds = [],
+    signal,
+    onDelta,
+    onThinking,
+    meta = {},
+    conversationKey = null,
+    buildDelta = null,
+    messages = [],
+  }) {
+    // 续聊：命中粘性会话就只发增量（服务端已有上下文），并把 parent_message_id 接上
+    let reuse = null;
+    if (conversationKey && this.config.runtime.stickyChat === true) {
+      const entry = this.sessions.get(conversationKey);
+      if (entry && Date.now() - entry.lastUsed < this.sessionTtlMs) {
+        const prefixSig = prefixSignature(messages, entry.consumedCount);
+        const sameConversation = prefixSig === entry.sig;
+        const bound = entry.accountIndex != null ? this.pool.accounts[entry.accountIndex] : null;
+        const accountUsable = Boolean(bound && bound.cooldownUntil <= Date.now());
+        if (sameConversation && accountUsable) reuse = entry;
+        else if (!sameConversation) {
+          // 前缀对不上：不同调用方/不同对话，绝不能复用（防止上下文串号）
+          this.sessions.delete(conversationKey);
+        }
+      }
+    }
+    const fullPrompt = prompt;
+    if (reuse) this.log.info?.(`续聊命中：${String(conversationKey).slice(0, 8)}…（会话 ${String(reuse.sessionId).slice(0, 8)}… / 已发 ${reuse.consumedCount} 条 / parent ${String(reuse.parentMessageId).slice(0, 8)}…）`);
+    else if (conversationKey) this.log.info?.(`新建会话：${String(conversationKey).slice(0, 8)}…`);
+    if (reuse && typeof buildDelta === 'function') {
+      try {
+        const delta = buildDelta(reuse.consumedCount);
+        this.log.info?.(`续聊 delta 长度=${typeof delta === 'string' ? delta.length : '非字符串'}`);
+        if (typeof delta === 'string' && delta.trim()) prompt = delta;
+        else {
+          this.log.warn?.('续聊 delta 为空，改回全量 prompt');
+          reuse = null;
+        }
+      } catch {
+        reuse = null;
+      }
+    }
     if (prompt.length > this.config.runtime.maxPromptChars) {
       throw new PromptTooLongError(
         `拼接后的 prompt 有 ${prompt.length} 字符，超过上限 ${this.config.runtime.maxPromptChars}`,
@@ -222,7 +437,17 @@ export class DirectEngine {
           fileOwnerIndex !== null && fileOwnerIndex !== undefined
             ? this.pool.accounts[fileOwnerIndex] ?? null
             : null;
-        const account = pinned && pinned.cooldownUntil <= now ? pinned : this.pool.pick(now);
+        // 粘性会话绑定账号：同一段对话必须落在同一个账号上（会话是账号私有的）
+        const sticky = reuse && reuse.accountIndex != null ? this.pool.accounts[reuse.accountIndex] : null;
+        const stickyOk = sticky && sticky.cooldownUntil <= now ? sticky : null;
+        if (reuse && !stickyOk) {
+          // 走到这里说明账号在计算 delta 之后失效了：放弃续聊，用全量 prompt 重来
+          reuse = null;
+          prompt = fullPrompt;
+          this.log.warn?.('续聊账号失效，改回全量 prompt');
+        }
+        const account =
+          pinned && pinned.cooldownUntil <= now ? pinned : stickyOk || this.pool.pick(now);
         if (!account) {
           const wait = this.pool.nextAvailableAt() - now;
           if (wait > maxCooldownWaitMs) {
@@ -243,9 +468,29 @@ export class DirectEngine {
 
         try {
           const result = await this.#run({
+            reuseSessionId: reuse?.sessionId || null,
+            reuseParentId: reuse?.parentMessageId || null,
+            reuseAccountIndex: reuse?.accountIndex ?? null,
             account, prompt, thinking, search, refFileIds, signal, onDelta, onThinking, startedAt, meta,
           });
           this.pool.markHealthy(account);
+          // 记录/更新粘性会话：下一轮只发增量
+          if (conversationKey && result?.sessionMessageId) {
+            const consumed = (messages || []).length;
+            this.sessions.set(conversationKey, {
+              sessionId: result.sessionId || reuse?.sessionId || null,
+              parentMessageId: result.sessionMessageId || null,
+              consumedCount: consumed,
+              sig: prefixSignature(messages, consumed),
+              accountIndex: account.index,
+              lastUsed: Date.now(),
+            });
+            this.log.info?.(`记录会话：session=${String(result.sessionId).slice(0, 8)}… msg=${String(result.sessionMessageId).slice(0, 8)}… 已发 ${consumed} 条`);
+            if (this.sessions.size > this.sessionMax) {
+              const oldest = [...this.sessions.entries()].sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+              if (oldest) this.sessions.delete(oldest[0]);
+            }
+          }
           return result;
         } catch (err) {
           if (signal?.aborted) throw err;
@@ -312,16 +557,17 @@ export class DirectEngine {
     }
   }
 
-  async #run({ account, prompt, thinking, search, refFileIds = [], signal, onDelta, onThinking, startedAt }) {
+  async #run({ account, prompt, thinking, search, refFileIds = [], signal, onDelta, onThinking, startedAt, reuseSessionId = null, reuseParentId = null }) {
     const powStart = Date.now();
     // powHeader 必须是 let：40301 重试时要把它置空，逼下一轮重新 fetch+solve，
     // 否则会一直拿同一个失效 header 重试（历史 bug：日志里连续 3 次 INVALID_POW_RESPONSE）。
     let powHeader;
     const [sessionId, initialPowHeader] = await Promise.all([
-      this.#takeSession(account, signal),
+      reuseSessionId ? Promise.resolve(reuseSessionId) : this.#takeSession(account, signal),
       this.#powHeader(account),
     ]);
     powHeader = initialPowHeader;
+    this.log.info?.(`#run session=${String(sessionId).slice(0, 8)}… reuse=${String(reuseSessionId).slice(0, 8)}… parent=${String(reuseParentId).slice(0, 8)}…`);
     const powMs = Date.now() - powStart;
     this.#prefetchPow(account);
 
@@ -367,7 +613,7 @@ export class DirectEngine {
           headers: { ...this.#headers(account), 'x-ds-pow-response': header },
           body: JSON.stringify({
             chat_session_id: sessionId,
-            parent_message_id: null,
+            parent_message_id: reuseParentId,
             model_type: 'default',
             prompt,
             ref_file_ids: refFileIds,
@@ -501,6 +747,8 @@ export class DirectEngine {
         }
 
         return {
+          sessionId,
+          sessionMessageId: state.messageId || null,
           text: emittedContent,
           reasoning: emittedReasoning,
           streamed: emittedContent,

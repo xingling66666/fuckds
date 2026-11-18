@@ -67,3 +67,37 @@ export class TimeoutError extends ApiError {
     this.name = 'TimeoutError';
   }
 }
+
+/**
+ * 风控类错误（40029 / 40303 / 40012 / 50006 …）。
+ *
+ * 单独一个类型，是为了让上层能按 kind 做不同处置：
+ *  - challenge / ip_restricted：换号可能也没用，必须停手或换出口；
+ *  - banned：这个号彻底废了；
+ *  - muted：等到 mute_until 之后再说；
+ *  - pow：同一账号换个 challenge 就能重试。
+ *
+ * `signal` 就是 risk.mjs 里的 RiskSignal，原样带出来便于日志/健康检查。
+ */
+export class RiskError extends UpstreamError {
+  constructor(signal, { message = null } = {}) {
+    const status =
+      signal.kind === 'ip_restricted' || signal.kind === 'muted' ? 429 : signal.kind === 'pow' ? 502 : 503;
+    const code = {
+      challenge: 'deepseek_captcha',
+      ip_restricted: 'deepseek_ip_restricted',
+      banned: 'deepseek_banned',
+      muted: 'deepseek_muted',
+      pow: 'deepseek_pow',
+      crypto: 'deepseek_crypto_required',
+      auth: 'deepseek_auth_required',
+    }[signal.kind] || 'deepseek_risk';
+    super(message || signal.reason || '上游风控拦截', { status, code });
+    this.name = 'RiskError';
+    this.signal = signal;
+    this.kind = signal.kind;
+    if (signal.kind === 'ip_restricted' || signal.kind === 'muted' || signal.kind === 'challenge') {
+      this.retryAfterMs = Math.max(1_000, signal.cooldownMs || 0);
+    }
+  }
+}

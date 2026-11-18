@@ -1,0 +1,14 @@
+2026/11/16-19:54:23.006 200e Reusing MANIFEST /root/opends-freetoken/profile_ds/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/16-19:54:23.007 200e Recovering log #231
+2026/11/16-19:54:23.007 200e Reusing old log /root/opends-freetoken/profile_ds/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000231.log 
+2026/11/16-19:54:23.007 200e Delete type=2 #230
+2026/11/16-19:54:23.103 200e Level-0 table #236: started
+2026/11/16-19:54:23.114 200e Level-0 table #236: 1434 bytes OK
+2026/11/16-19:54:23.154 200e Delete type=0 #231
+2026/11/16-19:54:23.155 2014 Manual compaction at level-0 from '\x00E\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00F\x00\x00\x00' @ 0 : 0; will stop at '\x00E\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5537 : 1
+2026/11/16-19:54:23.155 2014 Compacting 1@0 + 1@1 files
+2026/11/16-19:54:23.162 2014 Generated table #237@0: 28 keys, 456 bytes
+2026/11/16-19:54:23.162 2014 Compacted 1@0 + 1@1 files => 456 bytes
+2026/11/16-19:54:23.165 2014 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-19:54:23.169 2014 Delete type=2 #236
+2026/11/16-19:54:23.169 2008 Manual compaction at level-0 from '\x00E\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5537 : 1 .. '\x00F\x00\x00\x00' @ 0 : 0; will stop at (end)

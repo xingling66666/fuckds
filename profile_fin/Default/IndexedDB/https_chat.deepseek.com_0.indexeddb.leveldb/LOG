@@ -1,0 +1,47 @@
+2026/11/16-20:35:38.418 2d33 Reusing MANIFEST /root/opends-freetoken/profile_fin/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/16-20:35:38.419 2d33 Recovering log #54
+2026/11/16-20:35:38.419 2d33 Reusing old log /root/opends-freetoken/profile_fin/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000054.log 
+2026/11/16-20:35:38.420 2d33 Delete type=2 #53
+2026/11/16-20:35:38.549 2d33 Level-0 table #59: started
+2026/11/16-20:35:38.588 2d33 Level-0 table #59: 1057 bytes OK
+2026/11/16-20:35:38.595 2d33 Delete type=0 #54
+2026/11/16-20:35:38.596 2d33 Manual compaction at level-0 from '\x00\x12\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x13\x00\x00\x00' @ 0 : 0; will stop at '\x00\x12\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 1342 : 1
+2026/11/16-20:35:38.596 2d33 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:38.604 2d33 Generated table #60@0: 27 keys, 460 bytes
+2026/11/16-20:35:38.604 2d33 Compacted 1@0 + 1@1 files => 460 bytes
+2026/11/16-20:35:38.611 2d33 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:38.612 2d33 Delete type=2 #59
+2026/11/16-20:35:38.612 2d33 Manual compaction at level-0 from '\x00\x12\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 1342 : 1 .. '\x00\x13\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-20:35:39.300 2d3f Level-0 table #62: started
+2026/11/16-20:35:39.306 2d3f Level-0 table #62: 1429 bytes OK
+2026/11/16-20:35:39.312 2d3f Delete type=0 #58
+2026/11/16-20:35:39.312 2d3f Delete type=2 #56
+2026/11/16-20:35:39.313 2d39 Manual compaction at level-0 from '\x00\x13\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x14\x00\x00\x00' @ 0 : 0; will stop at '\x00\x13\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1427 : 1
+2026/11/16-20:35:39.313 2d39 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:39.322 2d39 Generated table #63@0: 27 keys, 461 bytes
+2026/11/16-20:35:39.322 2d39 Compacted 1@0 + 1@1 files => 461 bytes
+2026/11/16-20:35:39.329 2d39 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:39.330 2d39 Delete type=2 #62
+2026/11/16-20:35:39.331 2d3d Manual compaction at level-0 from '\x00\x13\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1427 : 1 .. '\x00\x14\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-20:35:40.596 2d33 Level-0 table #65: started
+2026/11/16-20:35:40.600 2d33 Level-0 table #65: 1416 bytes OK
+2026/11/16-20:35:40.604 2d33 Delete type=2 #60
+2026/11/16-20:35:40.604 2d33 Delete type=0 #61
+2026/11/16-20:35:40.605 2d33 Manual compaction at level-0 from '\x00\x14\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x15\x00\x00\x00' @ 0 : 0; will stop at '\x00\x14\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1517 : 1
+2026/11/16-20:35:40.605 2d33 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:40.610 2d33 Generated table #66@0: 27 keys, 460 bytes
+2026/11/16-20:35:40.610 2d33 Compacted 1@0 + 1@1 files => 460 bytes
+2026/11/16-20:35:40.614 2d33 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:40.615 2d33 Delete type=2 #65
+2026/11/16-20:35:40.616 2d33 Manual compaction at level-0 from '\x00\x14\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1517 : 1 .. '\x00\x15\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-20:35:42.197 2d33 Level-0 table #68: started
+2026/11/16-20:35:42.201 2d33 Level-0 table #68: 1462 bytes OK
+2026/11/16-20:35:42.211 2d33 Delete type=0 #64
+2026/11/16-20:35:42.211 2d33 Delete type=2 #63
+2026/11/16-20:35:42.211 2d33 Manual compaction at level-0 from '\x00\x15\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x16\x00\x00\x00' @ 0 : 0; will stop at '\x00\x15\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1607 : 1
+2026/11/16-20:35:42.211 2d33 Compacting 1@0 + 1@1 files
+2026/11/16-20:35:42.214 2d33 Generated table #69@0: 28 keys, 468 bytes
+2026/11/16-20:35:42.214 2d33 Compacted 1@0 + 1@1 files => 468 bytes
+2026/11/16-20:35:42.219 2d33 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-20:35:42.221 2d33 Delete type=2 #68
+2026/11/16-20:35:42.221 2d3d Manual compaction at level-0 from '\x00\x15\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 1607 : 1 .. '\x00\x16\x00\x00\x00' @ 0 : 0; will stop at (end)

@@ -220,14 +220,15 @@ function normalizeTools(tools) {
 }
 
 function resolveThinking(body, model, config) {
+  // 同 OpenAI 路径：强制开关优先，避免客户端显式 thinking:false 把这一轮关掉
+  if (config.deepseek.thinking === 'always') return true;
+  if (config.deepseek.thinking === 'never') return false;
   const thinking = body.thinking;
   if (thinking && typeof thinking === 'object') {
     if (thinking.type === 'enabled') return true;
     if (thinking.type === 'disabled') return false;
   }
   if (typeof thinking === 'boolean') return thinking;
-  if (config.deepseek.thinking === 'always') return true;
-  if (config.deepseek.thinking === 'never') return false;
 
   const alias = config.deepseek.modelAliases?.[model];
   if (alias && alias.thinking !== undefined) return alias.thinking;

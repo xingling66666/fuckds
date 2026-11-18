@@ -8,11 +8,14 @@ import Accounts from './pages/Accounts.jsx';
 import Playground from './pages/Playground.jsx';
 import Logs from './pages/Logs.jsx';
 import Settings from './pages/Settings.jsx';
+import Register from './pages/Register.jsx';
 import Docs from './pages/Docs.jsx';
+import Disclaimer, { disclaimerAcknowledged } from './Disclaimer.jsx';
 
 const PAGES = [
   { id: 'overview', label: '概览', icon: 'dashboard', hint: '服务状态、账号池、最近日志' },
   { id: 'accounts', label: '账号', icon: 'key', hint: '管理 DeepSeek 登录态（号池）' },
+  { id: 'register', label: '注册', icon: 'person_add', hint: '一键自动注册新号，支持定时' },
   { id: 'playground', label: '测试', icon: 'chat', hint: '直接发请求，逐字看输出' },
   { id: 'logs', label: '日志', icon: 'receipt_long', hint: '实时查看服务日志' },
   { id: 'settings', label: '设置', icon: 'tune', hint: '运行时配置与重启' },
@@ -22,6 +25,7 @@ const PAGES = [
 const COMPONENTS = {
   overview: Overview,
   accounts: Accounts,
+  register: Register,
   playground: Playground,
   logs: Logs,
   settings: Settings,
@@ -34,6 +38,7 @@ const THEME_ICON = { auto: 'brightness_auto', light: 'light_mode', dark: 'dark_m
 const THEME_LABEL = { auto: '主题：跟随系统', light: '主题：浅色', dark: '主题：深色' };
 
 export default function App({ initialTheme = 'auto' }) {
+  const [acknowledged, setAcknowledged] = useState(() => disclaimerAcknowledged());
   const [page, setPage] = useState('overview');
   const [refreshKey, setRefreshKey] = useState(0);
   const [theme, setThemeState] = useState(initialTheme);
@@ -77,6 +82,10 @@ export default function App({ initialTheme = 'auto' }) {
     setRefreshKey((value) => value + 1);
     toast('已清除本机保存的 API Key');
   };
+
+  if (!acknowledged) {
+    return <Disclaimer onAccept={() => setAcknowledged(true)} />;
+  }
 
   return (
     <div className="layout">

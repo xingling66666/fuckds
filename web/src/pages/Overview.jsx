@@ -97,10 +97,12 @@ export default function Overview({ navigate }) {
     );
   }
 
-  const accounts = data.accounts ?? [];
+  // 运行时号池：/admin/api/overview 直接摊平了 engine.status()（accounts 字段），
+  // 兼容某些构建把它放在 runtime 下的形态，两者都认，字段缺失时退化为空数组。
+  const accounts = data.accounts ?? data.runtime ?? [];
   const available = accounts.filter((account) => account.available).length;
   const authFailed = accounts.filter((account) => account.authFailed).length;
-  const engineLabel = data.engine === 'direct' ? '直连（direct）' : data.engine === 'browser' ? '浏览器（browser）' : data.engine;
+  const engineLabel = '浏览器（Chromium）';
 
   return (
     <div className="page">

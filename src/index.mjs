@@ -1,3 +1,9 @@
+import { applyCliArgs } from './cli.mjs';
+
+// 命令行 → 环境变量（必须在 loadConfig 之前执行；二进制自带的 --help/--version 也在这里处理）
+const cli = applyCliArgs();
+if (cli.exit) process.exit(0);
+
 import { loadConfig } from './config.mjs';
 import { createLogger } from './logger.mjs';
 import { createEngine } from './engine.mjs';
@@ -21,9 +27,10 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (err) => logger.error('未处理的 Promise 拒绝:', err));
 
 if (config.runtime.warmup) {
+  // hybrid / direct 模式预热的是直连侧（PoW 挑战 + 会话），不会拉起浏览器
   web.warmUp()
-    .then(() => logger.info('浏览器和对话页已预热'))
-    .catch((err) => logger.warn('预热失败（首次请求会重新启动）:', err.message));
+    .then(() => logger.info('引擎已预热（转发走直连接口，浏览器只在登录时启动）'))
+    .catch((err) => logger.warn('预热失败（首次请求会自动重试）:', err.message));
 }
 
 server.listen(config.server.port, config.server.host, () => {
@@ -39,7 +46,7 @@ server.listen(config.server.port, config.server.host, () => {
         : '未配置 ❌（npm run auth -- <userToken>）'
     }`,
   );
-  logger.info(`  引擎       ${web.status().engine || 'browser'}`);
+  logger.info(`  引擎       ${web.status().engine || 'hybrid'}`);
   logger.info(`  并发       ${config.runtime.concurrency}，单次超时 ${Math.round(config.runtime.requestTimeoutMs / 1000)}s`);
 });
 

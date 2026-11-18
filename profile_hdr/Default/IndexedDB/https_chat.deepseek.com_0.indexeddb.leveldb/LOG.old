@@ -1,0 +1,27 @@
+2026/11/16-21:01:14.829 3b09 Reusing MANIFEST /root/opends-freetoken/profile_hdr/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/11/16-21:01:14.830 3b09 Recovering log #13
+2026/11/16-21:01:14.830 3b09 Reusing old log /root/opends-freetoken/profile_hdr/Default/IndexedDB/https_chat.deepseek.com_0.indexeddb.leveldb/000013.log 
+2026/11/16-21:01:14.830 3b09 Delete type=2 #11
+2026/11/16-21:01:15.078 3b12 Level-0 table #18: started
+2026/11/16-21:01:15.081 3b12 Level-0 table #18: 603 bytes OK
+2026/11/16-21:01:15.094 3b12 Delete type=0 #13
+2026/11/16-21:01:15.095 3b09 Manual compaction at level-0 from '\x00\x01\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x02\x00\x00\x00' @ 0 : 0; will stop at '\x00\x01\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 425 : 0
+2026/11/16-21:01:15.095 3b09 Compacting 1@0 + 1@1 files
+2026/11/16-21:01:15.098 3b09 Generated table #19@0: 65 keys, 1043 bytes
+2026/11/16-21:01:15.098 3b09 Compacted 1@0 + 1@1 files => 1043 bytes
+2026/11/16-21:01:15.104 3b09 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/11/16-21:01:15.107 3b09 Delete type=2 #18
+2026/11/16-21:01:15.108 3b09 Manual compaction at level-0 from '\x00\x01\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 425 : 0 .. '\x00\x02\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-21:01:15.109 3b09 Manual compaction at level-1 from '\x00\x01\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x02\x00\x00\x00' @ 0 : 0; will stop at '\x00\x01\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 425 : 0
+2026/11/16-21:01:15.109 3b09 Compacting 1@1 + 1@2 files
+2026/11/16-21:01:15.119 3b09 Generated table #20@1: 7 keys, 275 bytes
+2026/11/16-21:01:15.119 3b09 Compacted 1@1 + 1@2 files => 275 bytes
+2026/11/16-21:01:15.124 3b09 compacted to: files[ 0 0 1 0 0 0 0 ]
+2026/11/16-21:01:15.126 3b09 Delete type=2 #19
+2026/11/16-21:01:15.130 3b09 Manual compaction at level-1 from '\x00\x01\x00\x00\xc8\x0f\x00h\x00i\x00s\x00t\x00o\x00r\x00y\x00-\x00m\x00e\x00s\x00s\x00a\x00g\x00e' @ 425 : 0 .. '\x00\x02\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/11/16-21:01:16.040 3b12 Level-0 table #22: started
+2026/11/16-21:01:16.044 3b12 Level-0 table #22: 1444 bytes OK
+2026/11/16-21:01:16.047 3b12 Delete type=2 #5
+2026/11/16-21:01:16.047 3b12 Delete type=0 #17
+2026/11/16-21:01:16.047 3b12 Delete type=2 #15
+2026/11/16-21:01:16.061 3b13 Manual compaction at level-0 from '\x00\x06\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x07\x00\x00\x00' @ 0 : 0; will stop at (end)

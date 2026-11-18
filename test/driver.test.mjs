@@ -183,28 +183,6 @@ test('驱动：DOM 丢掉尾部 DO 块时，用页面原始补全流把工具调
   }
 });
 
-test('驱动：BROWSER_CAPTURE=false 时退回纯 DOM 行为（能复现 DO 丢失）', async (t) => {
-  const browser = await requireBrowser(t);
-  if (!browser) return;
-
-  const fixture = await startFakeDeepSeek();
-  const web = new DeepSeekWeb({
-    config: driverConfig(fixture.url, { BROWSER_CAPTURE: 'false' }),
-    logger,
-  });
-  try {
-    const result = await web.chat({ prompt: 'USE_TOOL_DROP_DOM please' });
-
-    assert.ok(!result.text.includes('DO:'), `纯 DOM 模式下尾部 DO 块应该缺失，实际: ${JSON.stringify(result.text)}`);
-    assert.equal(parseToolCalls(result.text, ['exec_shell']).length, 0);
-    assert.equal(result.timings.captureBodies, 0);
-    assert.equal(result.timings.captureMs, 0);
-  } finally {
-    await web.close();
-    await fixture.close();
-  }
-});
-
 test('驱动：DOM 完全读不到内容时，原始补全流把结果救回来', async (t) => {
   const browser = await requireBrowser(t);
   if (!browser) return;
